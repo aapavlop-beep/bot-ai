@@ -50,7 +50,7 @@ def back_khl_keyboard() -> InlineKeyboardMarkup:
 
 
 async def safe_edit(callback: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
-    """Edit a message without treating Telegram's 'not modified' response as an error."""
+    """Изменяет сообщение и игнорирует Telegram 'message is not modified'."""
     try:
         await callback.message.edit_text(text, reply_markup=markup)
     except TelegramBadRequest as exc:
@@ -62,8 +62,8 @@ async def safe_edit(callback: CallbackQuery, text: str, markup: InlineKeyboardMa
 async def start(message: Message) -> None:
     await message.answer(
         "🎯 <b>Спортивная аналитика</b>\n\n"
-        "CS2 • КХЛ • футбол\n\n"
-        "Выбирай раздел:",
+        "🏒 КХЛ • ⚽ Футбол • 🎮 CS2\n\n"
+        "Выбери раздел:",
         reply_markup=main_menu(),
     )
 
@@ -74,7 +74,7 @@ async def callbacks(callback: CallbackQuery) -> None:
 
     try:
         if data == "menu":
-            text = "🎯 <b>Спортивная аналитика</b>\n\nCS2 • КХЛ • футбол\n\nВыбирай раздел:"
+            text = "🎯 <b>Спортивная аналитика</b>\n\n🏒 КХЛ • ⚽ Футбол • 🎮 CS2\n\nВыбери раздел:"
             markup = main_menu()
 
         elif data == "stats":
@@ -99,7 +99,7 @@ async def callbacks(callback: CallbackQuery) -> None:
 
         elif data == "top":
             text = (
-                "🔥 <b>Лучшие ставки</b>\n\n"
+                "🔥 <b>Лучшие прогнозы</b>\n\n"
                 "Пока нет проверенных сигналов. Сначала собираем реальные линии и историю модели."
             )
             markup = main_menu()
@@ -138,14 +138,15 @@ async def callbacks(callback: CallbackQuery) -> None:
                             prediction = await asyncio.to_thread(ai_predictor.predict, match)
                             text += AIPredictor.format(prediction)
                         except Exception as exc:
+                            print(f"AI prediction error: {type(exc).__name__}: {exc}")
                             text += (
                                 "\n\n⚠️ <b>ИИ-прогноз временно недоступен.</b>\n"
-                                f"Причина: {exc}"
+                                "Попробуйте открыть прогноз немного позже."
                             )
                     else:
                         text += (
                             "\n\n🤖 <b>ИИ-прогноз</b>\n"
-                            "Для него добавь OPENAI_API_KEY в локальный .env."
+                            "Добавьте OPENAI_API_KEY в локальный .env."
                         )
 
                     markup = back_khl_keyboard()
@@ -163,9 +164,10 @@ async def callbacks(callback: CallbackQuery) -> None:
         await callback.answer()
 
     except (ApiSportsError, ValueError) as exc:
+        print(f"Application error: {type(exc).__name__}: {exc}")
         error_text = (
-            "⚠️ Не удалось получить данные КХЛ.\n\n"
-            f"Проверь API_SPORTS_KEY и доступность API.\n\nОшибка: {exc}"
+            "⚠️ <b>Не удалось получить данные КХЛ.</b>\n\n"
+            "Проверьте настройки API или попробуйте позже."
         )
         await safe_edit(callback, error_text, main_menu())
         await callback.answer()
