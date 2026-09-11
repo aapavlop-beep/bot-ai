@@ -65,6 +65,34 @@ class ApiSportsClient:
     async def football_h2h(self, h2h: str, last: int = 10) -> list[dict[str, Any]]:
         return (await self.get(Sport.FOOTBALL, "fixtures/headtohead", h2h=h2h, last=last)).get("response", [])
 
+    @staticmethod
+    def _normalize_hockey_games(games: Any) -> list[dict[str, Any]]:
+        if not isinstance(games, list):
+            return []
+        normalized: list[dict[str, Any]] = []
+        for game in games:
+            if not isinstance(game, dict):
+                continue
+            item = dict(game)
+            scores = item.get("scores") or item.get("score")
+            if isinstance(scores, dict):
+                scores = dict(scores)
+                for side in ("home", "away"):
+                    value = scores.get(side)
+                    if isinstance(value, (int, float, str)):
+                        try:
+                            scores[side] = {"goals": int(value), "score": int(value)}
+                        except (TypeError, ValueError):
+                            pass
+                    elif isinstance(value, dict):
+                        value = dict(value)
+                        if "goals" not in value and "score" in value:
+                            value["goals"] = value["score"]
+                        scores[side] = value
+                item["scores"] = scores
+            normalized.append(item)
+        return normalized
+
     async def hockey_games(
         self,
         *,
@@ -82,7 +110,8 @@ class ApiSportsClient:
             params["season"] = season
         if team is not None:
             params["team"] = team
-        return (await self.get(Sport.KHL, "games", **params)).get("response", [])
+        response = (await self.get(Sport.KHL, "games", **params)).get("response", [])
+        return self._normalize_hockey_games(response)
 
     async def hockey_odds(self, *, game: int | None = None, league: int | None = None, season: str | None = None) -> list[dict[str, Any]]:
         params: dict[str, Any] = {}
@@ -95,11 +124,7 @@ class ApiSportsClient:
         return (await self.get(Sport.KHL, "odds", **params)).get("response", [])
 
     async def hockey_statistics(self, team: int, *, league: int | None = None, season: str | None = None) -> list[dict[str, Any]]:
-        """Возвращает team statistics в едином формате списка.
-
-        У API-Sports response этого endpoint — объект, а не массив. Старый
-        код ожидал список и из-за этого терял статистику с KeyError(0).
-        """
+        """Возвращает team statistics в едином формате списка."""
         params: dict[str, Any] = {"team": team}
         if league is not None:
             params["league"] = league
