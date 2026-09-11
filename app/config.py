@@ -5,6 +5,9 @@ class Settings(BaseSettings):
     bot_token: str
     log_level: str = "INFO"
     app_env: str = "development"
+    odds_api_key: str | None = None
+    odds_api_regions: str = "eu"
+    database_path: str = "data/bot.db"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
