@@ -20,11 +20,7 @@ from .storage import PredictionStore
 dp = Dispatcher()
 store = PredictionStore(settings.database_path)
 khl = KHLService(ApiSportsClient(settings.api_sports_key)) if settings.api_sports_key else None
-ai_predictor = (
-    AIPredictor(settings.openai_api_key, settings.openai_model)
-    if settings.openai_api_key
-    else None
-)
+ai_predictor = AIPredictor(settings.ollama_base_url, settings.ollama_model)
 
 
 def khl_games_keyboard(games: list[dict]) -> InlineKeyboardMarkup:
@@ -92,7 +88,7 @@ async def callbacks(callback: CallbackQuery) -> None:
             text = (
                 "ℹ️ <b>О боте</b>\n\n"
                 "Бот собирает спортивные данные, рассчитывает вероятности "
-                "и использует ИИ для итогового прогноза.\n\n"
+                "и использует локальный ИИ для итогового прогноза.\n\n"
                 "Сейчас запускаем первый полноценный раздел — КХЛ."
             )
             markup = main_menu()
@@ -133,20 +129,14 @@ async def callbacks(callback: CallbackQuery) -> None:
                     match = khl.to_match(game, markets)
                     text = khl.format_game(match) + khl.format_markets(match)
 
-                    if ai_predictor is not None:
-                        try:
-                            prediction = await asyncio.to_thread(ai_predictor.predict, match)
-                            text += AIPredictor.format(prediction)
-                        except Exception as exc:
-                            print(f"AI prediction error: {type(exc).__name__}: {exc}")
-                            text += (
-                                "\n\n⚠️ <b>ИИ-прогноз временно недоступен.</b>\n"
-                                "Попробуйте открыть прогноз немного позже."
-                            )
-                    else:
+                    try:
+                        prediction = await asyncio.to_thread(ai_predictor.predict, match)
+                        text += AIPredictor.format(prediction)
+                    except Exception as exc:
+                        print(f"AI prediction error: {type(exc).__name__}: {exc}")
                         text += (
-                            "\n\n🤖 <b>ИИ-прогноз</b>\n"
-                            "Добавьте OPENAI_API_KEY в локальный .env."
+                            "\n\n⚠️ <b>ИИ-прогноз временно недоступен.</b>\n"
+                            "Проверьте, что Ollama запущена и модель установлена."
                         )
 
                     markup = back_khl_keyboard()
