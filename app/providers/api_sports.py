@@ -12,11 +12,7 @@ class ApiSportsError(RuntimeError):
 
 
 class ApiSportsClient:
-    """Client for API-Sports football and hockey APIs.
-
-    API keys are never stored in source control. The caller supplies the key
-    from environment-backed settings.
-    """
+    """Client for API-Sports football and hockey APIs."""
 
     BASE_URLS = {
         Sport.FOOTBALL: "https://v3.football.api-sports.io",
@@ -69,7 +65,14 @@ class ApiSportsClient:
     async def football_h2h(self, h2h: str, last: int = 10) -> list[dict[str, Any]]:
         return (await self.get(Sport.FOOTBALL, "fixtures/headtohead", h2h=h2h, last=last)).get("response", [])
 
-    async def hockey_games(self, *, date: str | None = None, league: int | None = None, season: str | None = None) -> list[dict[str, Any]]:
+    async def hockey_games(
+        self,
+        *,
+        date: str | None = None,
+        league: int | None = None,
+        season: str | None = None,
+        team: int | None = None,
+    ) -> list[dict[str, Any]]:
         params: dict[str, Any] = {}
         if date:
             params["date"] = date
@@ -77,6 +80,8 @@ class ApiSportsClient:
             params["league"] = league
         if season:
             params["season"] = season
+        if team is not None:
+            params["team"] = team
         return (await self.get(Sport.KHL, "games", **params)).get("response", [])
 
     async def hockey_odds(self, *, game: int | None = None, league: int | None = None, season: str | None = None) -> list[dict[str, Any]]:
