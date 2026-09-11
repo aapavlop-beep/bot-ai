@@ -132,7 +132,7 @@ async def callbacks(callback: CallbackQuery) -> None:
                 markup = main_menu()
             else:
                 game_id = int(data.rsplit(":", 1)[1])
-                await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n1/4 Получаю данные матча и линию...")
+                await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n1/5 Получаю данные матча и линию...")
 
                 games = await khl.today_games()
                 game = next((item for item in games if int(item.get("id", -1)) == game_id), None)
@@ -140,15 +140,18 @@ async def callbacks(callback: CallbackQuery) -> None:
                     text = "Матч не найден. Обнови список матчей КХЛ."
                     markup = back_khl_keyboard()
                 else:
-                    await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n2/4 Получаю все доступные линии...")
+                    await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n2/5 Получаю все доступные линии...")
                     markets = await khl.markets_for_game(game_id)
-                    match = khl.to_match(game, markets)
+
+                    await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n3/5 Анализирую форму команд и сезонную статистику...")
+                    analysis_data = await khl.analysis_for_game(game)
+                    match = khl.to_match(game, markets, analysis_data)
 
                     await safe_status(
                         callback,
                         f"🏒 <b>{match.home} — {match.away}</b>\n\n"
-                        f"3/4 Линий получено: <b>{len(match.markets)}</b>\n"
-                        "🤖 GPT-6 Astra анализирует матч...",
+                        f"4/5 Линий получено: <b>{len(match.markets)}</b>\n"
+                        "🤖 GPT-6 Astra анализирует матч с учётом статистики...",
                     )
 
                     try:
