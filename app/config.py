@@ -9,8 +9,9 @@ class Settings(BaseSettings):
     odds_api_regions: str = "eu"
     api_sports_key: str | None = None
 
-    # Облачный ИИ через официальный OpenAI API.
+    # OpenAI-compatible API (official OpenAI or another compatible provider).
     openai_api_key: str | None = None
+    openai_base_url: str | None = None
     openai_model: str = "gpt-6-astra"
 
     database_path: str = "data/bot.db"
