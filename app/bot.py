@@ -1,4 +1,6 @@
 from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -49,7 +51,7 @@ async def safe_edit(callback: CallbackQuery, text: str, markup: InlineKeyboardMa
 @dp.message(CommandStart())
 async def start(message: Message) -> None:
     await message.answer(
-        "🎯 Спортивная аналитика\n\n"
+        "🎯 <b>Спортивная аналитика</b>\n\n"
         "CS2 • КХЛ • футбол\n\n"
         "Выбирай раздел:",
         reply_markup=main_menu(),
@@ -62,13 +64,13 @@ async def callbacks(callback: CallbackQuery) -> None:
 
     try:
         if data == "menu":
-            text = "🎯 Спортивная аналитика\n\nCS2 • КХЛ • футбол\n\nВыбирай раздел:"
+            text = "🎯 <b>Спортивная аналитика</b>\n\nCS2 • КХЛ • футбол\n\nВыбирай раздел:"
             markup = main_menu()
 
         elif data == "stats":
             stats = store.stats()
             text = (
-                "📊 Статистика модели\n\n"
+                "📊 <b>Статистика модели</b>\n\n"
                 f"Прогнозов: {stats['total']}\n"
                 f"Зашло: {stats['won']}\n"
                 f"Не зашло: {stats['lost']}\n"
@@ -78,7 +80,7 @@ async def callbacks(callback: CallbackQuery) -> None:
 
         elif data == "about":
             text = (
-                "ℹ️ О боте\n\n"
+                "ℹ️ <b>О боте</b>\n\n"
                 "Бот собирает спортивные данные, рассчитывает вероятности "
                 "и сравнивает их с коэффициентами.\n\n"
                 "Сейчас запускаем первый полноценный раздел — КХЛ."
@@ -86,20 +88,23 @@ async def callbacks(callback: CallbackQuery) -> None:
             markup = main_menu()
 
         elif data == "top":
-            text = "🔥 Лучшие ставки\n\nПока нет проверенных сигналов. Сначала собираем реальные линии и историю модели."
+            text = (
+                "🔥 <b>Лучшие ставки</b>\n\n"
+                "Пока нет проверенных сигналов. Сначала собираем реальные линии и историю модели."
+            )
             markup = main_menu()
 
         elif data == "sport:khl":
             if khl is None:
-                text = "🏒 КХЛ\n\nНе указан API_SPORTS_KEY в локальном .env."
+                text = "🏒 <b>КХЛ</b>\n\nНе указан API_SPORTS_KEY в локальном .env."
                 markup = main_menu()
             else:
                 games = await khl.today_games()
                 if not games:
-                    text = "🏒 КХЛ\n\nНа текущую дату матчи КХЛ не найдены или источник временно недоступен."
+                    text = "🏒 <b>КХЛ</b>\n\nНа текущую дату матчи КХЛ не найдены или источник временно недоступен."
                     markup = main_menu()
                 else:
-                    text = f"🏒 КХЛ\n\nМатчи на сегодня: {len(games)}\n\nВыбери матч:"
+                    text = f"🏒 <b>КХЛ</b>\n\nМатчи на сегодня: {len(games)}\n\nВыбери матч:"
                     markup = khl_games_keyboard(games)
 
         elif data.startswith("khl:game:"):
@@ -114,10 +119,7 @@ async def callbacks(callback: CallbackQuery) -> None:
                     text = "Матч не найден. Обнови список матчей КХЛ."
                     markup = back_khl_keyboard()
                 else:
-                    try:
-                        markets = await khl.markets_for_game(game_id)
-                    except ApiSportsError:
-                        markets = ()
+                    markets = await khl.markets_for_game(game_id)
                     match = khl.to_match(game, markets)
                     text = khl.format_game(match) + khl.format_markets(match)
                     markup = back_khl_keyboard()
@@ -144,5 +146,8 @@ async def callbacks(callback: CallbackQuery) -> None:
 
 
 async def run_bot() -> None:
-    bot = Bot(token=settings.bot_token)
+    bot = Bot(
+        token=settings.bot_token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
     await dp.start_polling(bot)
