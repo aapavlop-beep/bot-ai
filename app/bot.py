@@ -46,12 +46,21 @@ def back_khl_keyboard() -> InlineKeyboardMarkup:
 
 
 async def safe_edit(callback: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
-    """Изменяет сообщение и игнорирует Telegram 'message is not modified'."""
     try:
-        await callback.message.edit_text(text, reply_markup=markup)
+        if callback.message:
+            await callback.message.edit_text(text, reply_markup=markup)
     except TelegramBadRequest as exc:
         if "message is not modified" not in str(exc).lower():
             raise
+
+
+async def safe_status(callback: CallbackQuery, text: str) -> None:
+    """Показывает промежуточный статус и не ломает обработку из-за Telegram 400."""
+    try:
+        if callback.message:
+            await callback.message.edit_text(text)
+    except TelegramBadRequest:
+        pass
 
 
 @dp.message(CommandStart())
@@ -69,6 +78,9 @@ async def callbacks(callback: CallbackQuery) -> None:
     data = callback.data or ""
 
     try:
+        # Снимаем Telegram spinner сразу. Дальнейшие API/ИИ запросы могут занимать время.
+        await callback.answer()
+
         if data == "menu":
             text = "🎯 <b>Спортивная аналитика</b>\n\n🏒 КХЛ • ⚽ Футбол • 🎮 CS2\n\nВыбери раздел:"
             markup = main_menu()
@@ -119,26 +131,51 @@ async def callbacks(callback: CallbackQuery) -> None:
                 markup = main_menu()
             else:
                 game_id = int(data.rsplit(":", 1)[1])
+                await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n1/4 Получаю данные матча и линию...")
+
                 games = await khl.today_games()
                 game = next((item for item in games if int(item.get("id", -1)) == game_id), None)
                 if game is None:
                     text = "Матч не найден. Обнови список матчей КХЛ."
                     markup = back_khl_keyboard()
                 else:
+                    await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n2/4 Получаю все доступные линии...")
                     markets = await khl.markets_for_game(game_id)
                     match = khl.to_match(game, markets)
-                    text = khl.format_game(match) + khl.format_markets(match)
+
+                    await safe_status(
+                        callback,
+                        f"🏒 <b>{match.home} — {match.away}</b>\n\n"
+                        f"3/4 Линий получено: <b>{len(match.markets)}</b>\n"
+                        "🤖 ИИ анализирует матч...\n\nЭто может занять до нескольких минут на локальном ПК.",
+                    )
 
                     try:
-                        prediction = await asyncio.to_thread(ai_predictor.predict, match)
-                        text += AIPredictor.format(prediction)
+                        prediction = await asyncio.wait_for(
+                            asyncio.to_thread(ai_predictor.predict, match),
+                            timeout=150.0,
+                        )
+                        text = (
+                            khl.format_game(match)
+                            + khl.format_markets(match)
+                            + AIPredictor.format(prediction)
+                        )
+                    except asyncio.TimeoutError:
+                        print("AI prediction error: TimeoutError: Ollama did not answer within 150 seconds")
+                        text = (
+                            khl.format_game(match)
+                            + khl.format_markets(match)
+                            + "\n\n⚠️ <b>ИИ не успел ответить.</b>\n"
+                            "Локальная модель работает слишком медленно. Проверим Ollama и облегчим запрос."
+                        )
                     except Exception as exc:
                         print(f"AI prediction error: {type(exc).__name__}: {exc}")
-                        text += (
-                            "\n\n⚠️ <b>ИИ-прогноз временно недоступен.</b>\n"
-                            "Проверьте, что Ollama запущена и модель установлена."
+                        text = (
+                            khl.format_game(match)
+                            + khl.format_markets(match)
+                            + "\n\n⚠️ <b>ИИ-прогноз временно недоступен.</b>\n"
+                            f"Ошибка: {type(exc).__name__}"
                         )
-
                     markup = back_khl_keyboard()
 
         elif data.startswith("sport:"):
@@ -151,7 +188,6 @@ async def callbacks(callback: CallbackQuery) -> None:
             markup = main_menu()
 
         await safe_edit(callback, text, markup)
-        await callback.answer()
 
     except (ApiSportsError, ValueError) as exc:
         print(f"Application error: {type(exc).__name__}: {exc}")
@@ -160,7 +196,18 @@ async def callbacks(callback: CallbackQuery) -> None:
             "Проверьте настройки API или попробуйте позже."
         )
         await safe_edit(callback, error_text, main_menu())
-        await callback.answer()
+        try:
+            await callback.answer("Не удалось получить данные", show_alert=False)
+        except TelegramBadRequest:
+            pass
+
+    except Exception as exc:
+        print(f"Unhandled application error: {type(exc).__name__}: {exc}")
+        await safe_edit(
+            callback,
+            "⚠️ <b>Произошла ошибка.</b>\n\nПроверь CMD — там будет точная причина.",
+            main_menu(),
+        )
 
 
 async def run_bot() -> None:
