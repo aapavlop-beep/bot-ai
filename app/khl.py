@@ -8,7 +8,7 @@ from .providers.api_sports import ApiSportsClient
 
 
 class KHLService:
-    """KHL data, market normalization and a transparent baseline model."""
+    """Данные КХЛ, русификация рынков и базовая модель."""
 
     def __init__(self, client: ApiSportsClient) -> None:
         self.client = client
@@ -33,7 +33,7 @@ class KHLService:
         home, away = self._teams(game)
         return Match(
             sport=Sport.KHL,
-            league=str((game.get("league") or {}).get("name") or "KHL"),
+            league=str((game.get("league") or {}).get("name") or "КХЛ"),
             home=home,
             away=away,
             start_time=self._start_time(game),
@@ -50,7 +50,7 @@ class KHLService:
             for item in values:
                 if not isinstance(item, dict):
                     continue
-                name = str(item.get("value") or item.get("name") or "").strip()
+                name = self.translate_outcome(str(item.get("value") or item.get("name") or "").strip())
                 odd = self._odd(item.get("odd") or item.get("price") or item.get("odds"))
                 if not name or odd is None or odd <= 1.0:
                     continue
@@ -66,7 +66,7 @@ class KHLService:
                 continue
             for name, odd in parsed:
                 probability = (1.0 / odd) / denominator
-                markets.append(Market(name=f"{market_name}: {name}", odds=odd, probability=probability))
+                markets.append(Market(name=f"{self.translate_market(market_name)}: {name}", odds=odd, probability=probability))
 
         best: dict[str, Market] = {}
         for market in markets:
@@ -104,7 +104,7 @@ class KHLService:
 
     @staticmethod
     def _extract_bookmaker_bets(payload: Any) -> list[tuple[str, list[dict[str, Any]]]]:
-        """Normalize API-Sports odds responses whether response is dict or list."""
+        """Нормализует ответы API-Sports, если response приходит как dict или list."""
         if isinstance(payload, dict):
             result = payload.get("response") or []
         elif isinstance(payload, list):
@@ -139,13 +139,62 @@ class KHLService:
         return collected
 
     @staticmethod
+    def translate_market(name: str) -> str:
+        text = name.strip()
+        lower = text.lower()
+        replacements = {
+            "moneyline": "Победитель матча",
+            "match winner": "Победитель матча",
+            "winner": "Победитель матча",
+            "home/away": "Исход",
+            "home away": "Исход",
+            "double chance": "Двойной исход",
+            "handicap": "Фора",
+            "puck line": "Фора по шайбам",
+            "total": "Тотал",
+            "goals over/under": "Тотал шайб",
+            "goals over under": "Тотал шайб",
+            "period": "Период",
+            "1st period": "1-й период",
+            "2nd period": "2-й период",
+            "3rd period": "3-й период",
+            "odd/even": "Чёт / нечёт",
+            "odd even": "Чёт / нечёт",
+            "both teams to score": "Обе команды забьют",
+        }
+        for source, target in replacements.items():
+            if lower == source or source in lower:
+                text = text.replace(source, target).replace(source.title(), target)
+                break
+        return text
+
+    @staticmethod
+    def translate_outcome(name: str) -> str:
+        text = name.strip()
+        mapping = {
+            "home": "Хозяева",
+            "away": "Гости",
+            "draw": "Ничья",
+            "over": "Больше",
+            "under": "Меньше",
+            "yes": "Да",
+            "no": "Нет",
+            "odd": "Нечёт",
+            "even": "Чёт",
+            "1": "Хозяева",
+            "2": "Гости",
+            "x": "Ничья",
+        }
+        return mapping.get(text.lower(), text)
+
+    @staticmethod
     def format_game(match: Match) -> str:
         return f"🏒 <b>{match.home} — {match.away}</b>\n🕒 {match.start_time}\n🏆 {match.league}"
 
     @classmethod
     def format_markets(cls, match: Match) -> str:
         if not match.markets:
-            return "\n\nЛиния пока недоступна."
+            return "\n\n📈 <b>Линия пока недоступна.</b>"
         ranked = sorted(match.markets, key=cls.signal_score, reverse=True)
         lines = ["\n📈 <b>Лучшие линии</b>"]
         for index, market in enumerate(ranked[:15], 1):
@@ -154,9 +203,11 @@ class KHLService:
             label = cls.confidence_label(score)
             lines.append(
                 f"{index}. <b>{market.name}</b>\n"
-                f"   КФ {market.odds:.2f} • вероятность {market.probability * 100:.1f}%\n"
-                f"   Fair {market.fair_odds:.2f} • Value {value_sign}{market.value_percent:.1f}%\n"
-                f"   Сигнал {score:.1f}/10 • {label}"
+                f"   Коэффициент: {market.odds:.2f}\n"
+                f"   Вероятность: {market.probability * 100:.1f}%\n"
+                f"   Справедливый КФ: {market.fair_odds:.2f}\n"
+                f"   Преимущество: {value_sign}{market.value_percent:.1f}%\n"
+                f"   Сигнал: {score:.1f}/10 • {label}"
             )
         lines.append("\n<i>Вероятность — нормализованная рыночная оценка. Это базовый рейтинг, а не гарантия исхода.</i>")
         return "\n".join(lines)
