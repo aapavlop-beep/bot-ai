@@ -19,12 +19,7 @@ class AIPrediction:
 
 
 class AIPredictor:
-    """AI analyst that turns supplied match data into a structured forecast.
-
-    The model is explicitly forbidden from inventing statistics. It may only
-    use the facts supplied in the prompt. The numeric probability is therefore
-    an AI estimate based on the available evidence, not a guaranteed result.
-    """
+    """ИИ-аналитик, который формирует структурированный прогноз на русском."""
 
     def __init__(self, api_key: str, model: str) -> None:
         self.client = OpenAI(api_key=api_key)
@@ -61,7 +56,11 @@ class AIPredictor:
                 "вероятности выбранной ставки в процентах, а не вероятность "
                 "гарантированного выигрыша. Выбери только одну основную ставку. "
                 "Не называй ставку гарантированной и не используй 90%+ без очень "
-                "сильных оснований. Ответ строго по JSON-схеме."
+                "сильных оснований. ВЕСЬ пользовательский текст должен быть на "
+                "русском языке. Названия команд, турниров и официальные названия "
+                "рынков можно оставлять как пришли от источника. Не пиши английские "
+                "служебные слова вроде Pick, Probability, Confidence, Reason или "
+                "Alternative в значениях полей. Ответ строго по JSON-схеме."
             ),
             input=json.dumps(payload, ensure_ascii=False),
             text={
@@ -109,13 +108,13 @@ class AIPredictor:
 
     @staticmethod
     def format(prediction: AIPrediction) -> str:
-        alternatives = "\n".join(f"• {item}" for item in prediction.alternatives) or "• Нет"
+        alternatives = "\n".join(f"• {item}" for item in prediction.alternatives) or "• Нет подходящих альтернатив"
         return (
             "\n\n🤖 <b>ПРОГНОЗ ИИ</b>\n\n"
             f"🎯 <b>Основная ставка:</b> {prediction.pick}\n"
             f"📊 <b>Вероятность:</b> {prediction.probability:.1f}%\n"
-            f"🧠 <b>Уверенность модели:</b> {prediction.confidence:.1f}/10\n\n"
-            f"<b>Почему:</b> {prediction.reason}\n\n"
+            f"🧠 <b>Уверенность:</b> {prediction.confidence:.1f}/10\n\n"
+            f"<b>Обоснование:</b> {prediction.reason}\n\n"
             f"<b>Альтернативы:</b>\n{alternatives}\n\n"
             f"⚠️ <i>{prediction.caution}</i>"
         )
