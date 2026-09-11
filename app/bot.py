@@ -20,7 +20,7 @@ from .storage import PredictionStore
 dp = Dispatcher()
 store = PredictionStore(settings.database_path)
 khl = KHLService(ApiSportsClient(settings.api_sports_key)) if settings.api_sports_key else None
-ai_predictor = AIPredictor(settings.ollama_base_url, settings.ollama_model)
+ai_predictor = AIPredictor(settings.openai_api_key, settings.openai_model) if settings.openai_api_key else None
 
 
 def khl_games_keyboard(games: list[dict]) -> InlineKeyboardMarkup:
@@ -55,7 +55,6 @@ async def safe_edit(callback: CallbackQuery, text: str, markup: InlineKeyboardMa
 
 
 async def safe_status(callback: CallbackQuery, text: str) -> None:
-    """Показывает промежуточный статус и не ломает обработку из-за Telegram 400."""
     try:
         if callback.message:
             await callback.message.edit_text(text)
@@ -78,7 +77,6 @@ async def callbacks(callback: CallbackQuery) -> None:
     data = callback.data or ""
 
     try:
-        # Снимаем Telegram spinner сразу. Дальнейшие API/ИИ запросы могут занимать время.
         await callback.answer()
 
         if data == "menu":
@@ -100,7 +98,7 @@ async def callbacks(callback: CallbackQuery) -> None:
             text = (
                 "ℹ️ <b>О боте</b>\n\n"
                 "Бот собирает спортивные данные, рассчитывает вероятности "
-                "и использует локальный ИИ для итогового прогноза.\n\n"
+                "и использует GPT-6 Astra для итогового анализа.\n\n"
                 "Сейчас запускаем первый полноценный раздел — КХЛ."
             )
             markup = main_menu()
@@ -129,6 +127,9 @@ async def callbacks(callback: CallbackQuery) -> None:
             if khl is None:
                 text = "Не указан API_SPORTS_KEY в локальном .env."
                 markup = main_menu()
+            elif ai_predictor is None:
+                text = "⚠️ <b>ИИ не настроен.</b>\n\nДобавь OPENAI_API_KEY в локальный .env и перезапусти бота."
+                markup = main_menu()
             else:
                 game_id = int(data.rsplit(":", 1)[1])
                 await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n1/4 Получаю данные матча и линию...")
@@ -147,26 +148,21 @@ async def callbacks(callback: CallbackQuery) -> None:
                         callback,
                         f"🏒 <b>{match.home} — {match.away}</b>\n\n"
                         f"3/4 Линий получено: <b>{len(match.markets)}</b>\n"
-                        "🤖 ИИ анализирует матч...\n\nЭто может занять до нескольких минут на локальном ПК.",
+                        "🤖 GPT-6 Astra анализирует матч...",
                     )
 
                     try:
                         prediction = await asyncio.wait_for(
                             asyncio.to_thread(ai_predictor.predict, match),
-                            timeout=150.0,
+                            timeout=90.0,
                         )
-                        text = (
-                            khl.format_game(match)
-                            + khl.format_markets(match)
-                            + AIPredictor.format(prediction)
-                        )
+                        text = khl.format_game(match) + khl.format_markets(match) + AIPredictor.format(prediction)
                     except asyncio.TimeoutError:
-                        print("AI prediction error: TimeoutError: Ollama did not answer within 150 seconds")
+                        print("AI prediction error: TimeoutError: OpenAI did not answer within 90 seconds")
                         text = (
                             khl.format_game(match)
                             + khl.format_markets(match)
-                            + "\n\n⚠️ <b>ИИ не успел ответить.</b>\n"
-                            "Локальная модель работает слишком медленно. Проверим Ollama и облегчим запрос."
+                            + "\n\n⚠️ <b>ИИ не успел ответить.</b>\nПопробуй запрос ещё раз."
                         )
                     except Exception as exc:
                         print(f"AI prediction error: {type(exc).__name__}: {exc}")
@@ -191,10 +187,7 @@ async def callbacks(callback: CallbackQuery) -> None:
 
     except (ApiSportsError, ValueError) as exc:
         print(f"Application error: {type(exc).__name__}: {exc}")
-        error_text = (
-            "⚠️ <b>Не удалось получить данные КХЛ.</b>\n\n"
-            "Проверьте настройки API или попробуйте позже."
-        )
+        error_text = "⚠️ <b>Не удалось получить данные КХЛ.</b>\n\nПроверьте настройки API или попробуйте позже."
         await safe_edit(callback, error_text, main_menu())
         try:
             await callback.answer("Не удалось получить данные", show_alert=False)
@@ -203,11 +196,7 @@ async def callbacks(callback: CallbackQuery) -> None:
 
     except Exception as exc:
         print(f"Unhandled application error: {type(exc).__name__}: {exc}")
-        await safe_edit(
-            callback,
-            "⚠️ <b>Произошла ошибка.</b>\n\nПроверь CMD — там будет точная причина.",
-            main_menu(),
-        )
+        await safe_edit(callback, "⚠️ <b>Произошла ошибка.</b>\n\nПроверь CMD — там будет точная причина.", main_menu())
 
 
 async def run_bot() -> None:
