@@ -101,7 +101,7 @@ async def callbacks(callback: CallbackQuery) -> None:
             text = (
                 "ℹ️ <b>О боте</b>\n\n"
                 "Бот собирает спортивные данные, рассчитывает вероятности "
-                "и использует GPT-6 Astra для итогового анализа.\n\n"
+                "и использует ИИ для итогового анализа.\n\n"
                 "Сейчас запускаем первый полноценный раздел — КХЛ."
             )
             markup = main_menu()
@@ -164,7 +164,7 @@ async def callbacks(callback: CallbackQuery) -> None:
                         callback,
                         f"🏒 <b>{match.home} — {match.away}</b>\n\n"
                         f"4/5 Линий получено: <b>{len(match.markets)}</b>\n"
-                        "🤖 GPT-6 Astra анализирует матч с учётом статистики...",
+                        "🤖 ИИ анализирует матч с учётом статистики...",
                     )
 
                     try:
@@ -172,19 +172,20 @@ async def callbacks(callback: CallbackQuery) -> None:
                             asyncio.to_thread(ai_predictor.predict, match),
                             timeout=90.0,
                         )
-                        text = khl.format_game(match) + khl.format_markets(match) + AIPredictor.format(prediction)
+                        # Все линии анализируются внутри модели, но пользователю
+                        # показываем только итоговый сильный сигнал. Рыночный
+                        # рейтинг из 15–30 линий больше не выводится.
+                        text = khl.format_game(match) + AIPredictor.format(prediction)
                     except asyncio.TimeoutError:
-                        print("AI prediction error: TimeoutError: OpenAI did not answer within 90 seconds")
+                        print("AI prediction error: TimeoutError: AI did not answer within 90 seconds")
                         text = (
                             khl.format_game(match)
-                            + khl.format_markets(match)
                             + "\n\n⚠️ <b>ИИ не успел ответить.</b>\nПопробуй запрос ещё раз."
                         )
                     except Exception as exc:
                         print(f"AI prediction error: {type(exc).__name__}: {exc}")
                         text = (
                             khl.format_game(match)
-                            + khl.format_markets(match)
                             + "\n\n⚠️ <b>ИИ-прогноз временно недоступен.</b>\n"
                             f"Ошибка: {type(exc).__name__}"
                         )
