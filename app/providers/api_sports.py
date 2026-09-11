@@ -95,9 +95,19 @@ class ApiSportsClient:
         return (await self.get(Sport.KHL, "odds", **params)).get("response", [])
 
     async def hockey_statistics(self, team: int, *, league: int | None = None, season: str | None = None) -> list[dict[str, Any]]:
+        """Возвращает team statistics в едином формате списка.
+
+        У API-Sports response этого endpoint — объект, а не массив. Старый
+        код ожидал список и из-за этого терял статистику с KeyError(0).
+        """
         params: dict[str, Any] = {"team": team}
         if league is not None:
             params["league"] = league
         if season:
             params["season"] = season
-        return (await self.get(Sport.KHL, "teams/statistics", **params)).get("response", [])
+        response = (await self.get(Sport.KHL, "teams/statistics", **params)).get("response", {})
+        if isinstance(response, dict):
+            return [response]
+        if isinstance(response, list):
+            return response
+        return []
