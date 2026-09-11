@@ -1,4 +1,5 @@
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -34,6 +35,15 @@ def back_khl_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu")],
         ]
     )
+
+
+async def safe_edit(callback: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
+    """Edit a message without treating Telegram's 'not modified' response as an error."""
+    try:
+        await callback.message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
 
 
 @dp.message(CommandStart())
@@ -121,15 +131,15 @@ async def callbacks(callback: CallbackQuery) -> None:
             text = "Раздел пока не настроен."
             markup = main_menu()
 
-        await callback.message.edit_text(text, reply_markup=markup)
+        await safe_edit(callback, text, markup)
         await callback.answer()
 
     except (ApiSportsError, ValueError) as exc:
-        await callback.message.edit_text(
+        error_text = (
             "⚠️ Не удалось получить данные КХЛ.\n\n"
-            f"Проверь API_SPORTS_KEY и доступность API.\n\nОшибка: {exc}",
-            reply_markup=main_menu(),
+            f"Проверь API_SPORTS_KEY и доступность API.\n\nОшибка: {exc}"
         )
+        await safe_edit(callback, error_text, main_menu())
         await callback.answer()
 
 
