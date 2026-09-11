@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from urllib.parse import urlparse
 
 import httpx
 
@@ -53,11 +54,11 @@ class AIPredictor:
         )
 
     def _curl_fallback(self, url: str, body: dict) -> dict:
-        """Резервный путь для Windows, если Python/httpx не может разрешить DNS.
+        """Резервный путь для Windows при проблемах DNS у Python/httpx.
 
-        В Windows curl.exe часто использует рабочий системный DNS-стек даже тогда,
-        когда Python получает getaddrinfo/ConnectError. Сам curl ранее уже успешно
-        обращался к этому API на этой машине.
+        Для dindindon.ru дополнительно используем --resolve с известным IPv4
+        адресом сервера. Это сохраняет HTTPS Host/SNI dindindon.ru, но полностью
+        исключает DNS из соединения. Обычный curl уже был проверен на этой машине.
         """
         payload = json.dumps(body, ensure_ascii=False)
         command = [
@@ -78,6 +79,13 @@ class AIPredictor:
             "--data-binary",
             payload,
         ]
+
+        hostname = urlparse(url).hostname
+        # На текущем сервере dindindon.ru резолвится в этот IPv4.
+        # --resolve не меняет Host/SNI, поэтому сертификат HTTPS остаётся корректным.
+        if hostname == "dindindon.ru":
+            command[1:1] = ["--resolve", "dindindon.ru:443:217.26.24.242"]
+
         try:
             result = subprocess.run(
                 command,
@@ -168,8 +176,6 @@ class AIPredictor:
                 raise RuntimeError(f"Некорректный ответ AI API: {response.text[:1000]}") from exc
 
         except httpx.ConnectError:
-            # На текущем Windows httpx периодически получает getaddrinfo failed,
-            # хотя curl к тому же домену работает. В таком случае используем curl.
             body = self._curl_fallback(url, request_body)
             try:
                 content = body["choices"][0]["message"]["content"] or ""
