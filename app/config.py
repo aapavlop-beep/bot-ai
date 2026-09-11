@@ -9,9 +9,9 @@ class Settings(BaseSettings):
     odds_api_regions: str = "eu"
     api_sports_key: str | None = None
 
-    # Локальный ИИ через Ollama. OpenAI API для работы бота не требуется.
-    ollama_base_url: str = "http://127.0.0.1:11434"
-    ollama_model: str = "qwen3:4b"
+    # Облачный ИИ через официальный OpenAI API.
+    openai_api_key: str | None = None
+    openai_model: str = "gpt-6-astra"
 
     database_path: str = "data/bot.db"
 
