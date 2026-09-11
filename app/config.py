@@ -9,7 +9,8 @@ class Settings(BaseSettings):
     odds_api_regions: str = "eu"
     api_sports_key: str | None = None
     openai_api_key: str | None = None
-    openai_model: str = "gpt-5.6-luna"
+    openai_model: str = "gpt-6-astra"
+    openai_reasoning_effort: str = "high"
     database_path: str = "data/bot.db"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
