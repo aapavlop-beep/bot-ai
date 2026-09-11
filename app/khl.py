@@ -9,7 +9,7 @@ from .providers.api_sports import ApiSportsClient
 
 
 class KHLService:
-    """Данные КХЛ, русификация рынков и базовая модель."""
+    """Данные КХЛ, русификация рынков и контекст для ИИ."""
 
     def __init__(self, client: ApiSportsClient) -> None:
         self.client = client
@@ -30,7 +30,33 @@ class KHLService:
     def _start_time(game: dict[str, Any]) -> str:
         return str(game.get("date") or game.get("datetime") or "")
 
-    def to_match(self, game: dict[str, Any], markets: tuple[Market, ...] = ()) -> Match:
+    @staticmethod
+    def _team_id(game: dict[str, Any], side: str) -> int | None:
+        try:
+            value = ((game.get("teams") or {}).get(side) or {}).get("id")
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _league_id(game: dict[str, Any]) -> int | None:
+        try:
+            value = (game.get("league") or {}).get("id")
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _season(game: dict[str, Any]) -> str | None:
+        value = (game.get("league") or {}).get("season")
+        return str(value) if value not in (None, "") else None
+
+    def to_match(
+        self,
+        game: dict[str, Any],
+        markets: tuple[Market, ...] = (),
+        analysis_data: dict[str, Any] | None = None,
+    ) -> Match:
         home, away = self._teams(game)
         return Match(
             sport=Sport.KHL,
@@ -39,7 +65,136 @@ class KHLService:
             away=away,
             start_time=self._start_time(game),
             markets=markets,
+            analysis_data=analysis_data or {},
         )
+
+    async def analysis_for_game(self, game: dict[str, Any]) -> dict[str, Any]:
+        """Собирает сезонную статистику и последние завершённые матчи обеих команд.
+
+        Если отдельный endpoint недоступен, не ломает прогноз: возвращает только
+        те данные, которые удалось получить.
+        """
+        league_id = self._league_id(game)
+        season = self._season(game)
+        context: dict[str, Any] = {"источник": "API-Sports", "сезон": season}
+
+        for side, label in (("home", "хозяева"), ("away", "гости")):
+            team_id = self._team_id(game, side)
+            if team_id is None:
+                continue
+
+            team_context: dict[str, Any] = {}
+            try:
+                stats = await self.client.hockey_statistics(team_id, league=league_id, season=season)
+                if stats:
+                    team_context["сезонная_статистика"] = self._compact_team_stats(stats[0])
+            except Exception as exc:
+                team_context["ошибка_статистики"] = type(exc).__name__
+
+            try:
+                history = await self.client.hockey_games(team=team_id, league=league_id, season=season)
+                completed = [g for g in history if self._is_completed(g)]
+                completed.sort(key=lambda item: str(item.get("date") or ""), reverse=True)
+                team_context["последние_матчи"] = [self._compact_game(g, team_id) for g in completed[:10]]
+                team_context["форма_последних_10"] = self._form_summary(completed[:10], team_id)
+            except Exception as exc:
+                team_context["ошибка_истории"] = type(exc).__name__
+
+            context[label] = team_context
+
+        return context
+
+    @staticmethod
+    def _is_completed(game: dict[str, Any]) -> bool:
+        status = str((game.get("status") or {}).get("short") or (game.get("status") or {}).get("long") or "").lower()
+        if any(word in status for word in ("not started", "scheduled", "postponed", "cancelled", "canceled")):
+            return False
+        score = game.get("scores") or game.get("score") or {}
+        return bool(score)
+
+    @staticmethod
+    def _score_value(game: dict[str, Any], side: str) -> int | None:
+        scores = game.get("scores") or game.get("score") or {}
+        try:
+            value = (scores.get(side) or {}).get("goals")
+            if value is None:
+                value = (scores.get(side) or {}).get("score")
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _compact_game(cls, game: dict[str, Any], team_id: int) -> dict[str, Any]:
+        teams = game.get("teams") or {}
+        home = teams.get("home") or {}
+        away = teams.get("away") or {}
+        home_id = home.get("id")
+        side = "home" if str(home_id) == str(team_id) else "away"
+        hs = cls._score_value(game, "home")
+        aws = cls._score_value(game, "away")
+        result = "неизвестно"
+        if hs is not None and aws is not None:
+            team_score = hs if side == "home" else aws
+            opp_score = aws if side == "home" else hs
+            result = "победа" if team_score > opp_score else "поражение" if team_score < opp_score else "ничья"
+        return {
+            "дата": str(game.get("date") or "")[:10],
+            "соперник": str((away if side == "home" else home).get("name") or ""),
+            "счёт": f"{hs}:{aws}" if hs is not None and aws is not None else "нет",
+            "результат": result,
+        }
+
+    @classmethod
+    def _form_summary(cls, games: list[dict[str, Any]], team_id: int) -> dict[str, Any]:
+        wins = losses = draws = scored = conceded = 0
+        for game in games:
+            teams = game.get("teams") or {}
+            side = "home" if str((teams.get("home") or {}).get("id")) == str(team_id) else "away"
+            hs = cls._score_value(game, "home")
+            aws = cls._score_value(game, "away")
+            if hs is None or aws is None:
+                continue
+            scored += hs if side == "home" else aws
+            conceded += aws if side == "home" else hs
+            team_score = hs if side == "home" else aws
+            opp_score = aws if side == "home" else hs
+            if team_score > opp_score:
+                wins += 1
+            elif team_score < opp_score:
+                losses += 1
+            else:
+                draws += 1
+        count = wins + losses + draws
+        return {
+            "матчей": count,
+            "побед": wins,
+            "поражений": losses,
+            "ничьих": draws,
+            "забито": scored,
+            "пропущено": conceded,
+            "среднее_забито": round(scored / count, 2) if count else None,
+            "среднее_пропущено": round(conceded / count, 2) if count else None,
+        }
+
+    @staticmethod
+    def _compact_team_stats(raw: Any) -> dict[str, Any]:
+        """Оставляет только числовые/структурные показатели, полезные ИИ."""
+        if not isinstance(raw, dict):
+            return {}
+        response = raw.get("response") if isinstance(raw.get("response"), dict) else raw
+        if not isinstance(response, dict):
+            return {}
+        result: dict[str, Any] = {}
+        for key, value in response.items():
+            if key in {"team", "league"}:
+                continue
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                result[str(key)] = value
+            elif isinstance(value, dict):
+                compact = {str(k): v for k, v in value.items() if isinstance(v, (str, int, float, bool)) or v is None}
+                if compact:
+                    result[str(key)] = compact
+        return result
 
     async def markets_for_game(self, game_id: int) -> tuple[Market, ...]:
         payload = await self.client.hockey_odds(game=game_id)
@@ -105,7 +260,6 @@ class KHLService:
 
     @staticmethod
     def _extract_bookmaker_bets(payload: Any) -> list[tuple[str, list[dict[str, Any]]]]:
-        """Нормализует ответы API-Sports, если response приходит как dict или list."""
         if isinstance(payload, dict):
             result = payload.get("response") or []
         elif isinstance(payload, list):
@@ -141,7 +295,6 @@ class KHLService:
 
     @staticmethod
     def _replace_phrases(text: str, replacements: dict[str, str]) -> str:
-        """Заменяет английские названия рынков без учета регистра."""
         result = text
         for source, target in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
             result = re.sub(re.escape(source), target, result, flags=re.IGNORECASE)
