@@ -1,29 +1,73 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 
-from openai import OpenAI
+import httpx
 
 from .models import Match
 
 
-@dataclass(frozen=True)
 class AIPrediction:
-    pick: str
-    probability: float
-    confidence: float
-    reason: str
-    alternatives: tuple[str, ...]
-    caution: str
+    def __init__(self, pick: str, probability: float, confidence: float, reason: str, alternatives: tuple[str, ...], caution: str) -> None:
+        self.pick = pick
+        self.probability = probability
+        self.confidence = confidence
+        self.reason = reason
+        self.alternatives = alternatives
+        self.caution = caution
 
 
 class AIPredictor:
-    """ИИ-аналитик, который формирует структурированный прогноз на русском."""
+    """Локальный ИИ-аналитик через Ollama. Интернет/OpenAI API для ИИ не нужен."""
 
-    def __init__(self, api_key: str, model: str) -> None:
-        self.client = OpenAI(api_key=api_key)
+    def __init__(self, base_url: str, model: str) -> None:
+        self.base_url = base_url.rstrip("/")
         self.model = model
+
+    def _request(self, payload: dict) -> dict:
+        url = f"{self.base_url}/api/chat"
+        with httpx.Client(timeout=180.0) as client:
+            response = client.post(
+                url,
+                json={
+                    "model": self.model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Ты автономный спортивный аналитик. Отвечай только на русском языке. "
+                                "Анализируй только переданные данные и не выдумывай факты. "
+                                "Ты можешь выбрать только одну основную ставку. "
+                                "Вероятность должна быть реалистичной оценкой, а не гарантией. "
+                                "Не используй 90%+ без исключительных оснований. "
+                                "Если данных недостаточно, снижай уверенность. "
+                                "Не называй ставку гарантированной. Верни только JSON без markdown."
+                            ),
+                        },
+                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                    ],
+                    "stream": False,
+                    "think": False,
+                    "format": {
+                        "type": "object",
+                        "properties": {
+                            "pick": {"type": "string"},
+                            "probability": {"type": "number"},
+                            "confidence": {"type": "number"},
+                            "reason": {"type": "string"},
+                            "alternatives": {"type": "array", "items": {"type": "string"}},
+                            "caution": {"type": "string"},
+                        },
+                        "required": ["pick", "probability", "confidence", "reason", "alternatives", "caution"],
+                    },
+                    "options": {"temperature": 0.15},
+                },
+            )
+            response.raise_for_status()
+            body = response.json()
+            message = body.get("message") or {}
+            content = message.get("content") or "{}"
+            return json.loads(content)
 
     def predict(self, match: Match) -> AIPrediction:
         markets = [
@@ -38,71 +82,30 @@ class AIPredictor:
         ]
 
         payload = {
-            "sport": match.sport.value,
-            "league": match.league,
-            "home": match.home,
-            "away": match.away,
-            "start_time": match.start_time,
-            "markets": markets,
+            "спорт": match.sport.value,
+            "лига": match.league,
+            "хозяева": match.home,
+            "гости": match.away,
+            "начало": match.start_time,
+            "доступные_линии": markets,
+            "задача": (
+                "Выбери лучшую доступную линию для прогноза. "
+                "Укажи вероятность в процентах, уверенность от 0 до 10, "
+                "краткое обоснование, до 3 альтернатив и предупреждение о риске."
+            ),
         }
 
-        response = self.client.responses.create(
-            model=self.model,
-            instructions=(
-                "Ты спортивный аналитик. Составь осторожный прогноз только по "
-                "данным, которые переданы во входе. Не выдумывай травмы, форму, "
-                "составы, статистику, новости или факты, которых нет во входе. "
-                "Если данных мало, снижай confidence. Вероятность — твоя оценка "
-                "вероятности выбранной ставки в процентах, а не вероятность "
-                "гарантированного выигрыша. Выбери только одну основную ставку. "
-                "Не называй ставку гарантированной и не используй 90%+ без очень "
-                "сильных оснований. ВЕСЬ пользовательский текст должен быть на "
-                "русском языке. Названия команд, турниров и официальные названия "
-                "рынков можно оставлять как пришли от источника. Не пиши английские "
-                "служебные слова вроде Pick, Probability, Confidence, Reason или "
-                "Alternative в значениях полей. Ответ строго по JSON-схеме."
-            ),
-            input=json.dumps(payload, ensure_ascii=False),
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "sports_prediction",
-                    "strict": True,
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "pick": {"type": "string"},
-                            "probability": {"type": "number", "minimum": 0, "maximum": 100},
-                            "confidence": {"type": "number", "minimum": 0, "maximum": 10},
-                            "reason": {"type": "string"},
-                            "alternatives": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "maxItems": 3,
-                            },
-                            "caution": {"type": "string"},
-                        },
-                        "required": [
-                            "pick",
-                            "probability",
-                            "confidence",
-                            "reason",
-                            "alternatives",
-                            "caution",
-                        ],
-                        "additionalProperties": False,
-                    },
-                }
-            },
-        )
+        data = self._request(payload)
+        probability = max(0.0, min(100.0, float(data["probability"])))
+        confidence = max(0.0, min(10.0, float(data["confidence"])))
+        alternatives = tuple(str(item) for item in data.get("alternatives", [])[:3])
 
-        data = json.loads(response.output_text)
         return AIPrediction(
             pick=str(data["pick"]),
-            probability=float(data["probability"]),
-            confidence=float(data["confidence"]),
+            probability=probability,
+            confidence=confidence,
             reason=str(data["reason"]),
-            alternatives=tuple(str(item) for item in data["alternatives"]),
+            alternatives=alternatives,
             caution=str(data["caution"]),
         )
 
