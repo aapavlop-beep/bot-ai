@@ -1,5 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 
 class Sport(str, Enum):
@@ -31,3 +32,4 @@ class Match:
     away: str
     start_time: str
     markets: tuple[Market, ...]
+    analysis_data: dict[str, Any] = field(default_factory=dict)
