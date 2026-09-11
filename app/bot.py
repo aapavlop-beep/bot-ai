@@ -20,7 +20,7 @@ from .storage import PredictionStore
 dp = Dispatcher()
 store = PredictionStore(settings.database_path)
 khl = KHLService(ApiSportsClient(settings.api_sports_key)) if settings.api_sports_key else None
-ai_predictor = AIPredictor(settings.openai_api_key, settings.openai_model) if settings.openai_api_key else None
+ai_predictor = AIPredictor(settings.openai_api_key, settings.openai_model, settings.openai_base_url) if settings.openai_api_key else None
 
 
 def khl_games_keyboard(games: list[dict]) -> InlineKeyboardMarkup:
