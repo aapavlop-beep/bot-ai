@@ -8,12 +8,12 @@ from .providers.api_sports import ApiSportsClient, ApiSportsError
 
 
 class KHLService:
-    """KHL data and market adapter.
+    """KHL data, market normalization and a transparent baseline model.
 
-    The first version deliberately uses bookmaker prices as the baseline
-    probability source. We normalize implied probabilities to remove the
-    bookmaker margin. Later the statistical model can replace/adjust this
-    baseline without changing the Telegram layer.
+    The baseline model is market-derived: it removes the bookmaker margin and
+    adds a conservative signal score from probability, Value and market type.
+    It is intentionally not presented as an ML model until we have enough
+    historical samples for backtesting and calibration.
     """
 
     def __init__(self, client: ApiSportsClient) -> None:
@@ -22,12 +22,11 @@ class KHLService:
     async def today_games(self) -> list[dict[str, Any]]:
         today = datetime.now(timezone.utc).date().isoformat()
         games = await self.client.hockey_games(date=today)
-        return [g for g in games if str(g.get("league", {}).get("name", "")).strip().lower() == "khl"]
-
-    @staticmethod
-    def _game_id(game: dict[str, Any]) -> int | None:
-        value = game.get("id")
-        return int(value) if value is not None else None
+        return [
+            g
+            for g in games
+            if str(g.get("league", {}).get("name", "")).strip().lower() == "khl"
+        ]
 
     @staticmethod
     def _teams(game: dict[str, Any]) -> tuple[str, str]:
@@ -38,8 +37,7 @@ class KHLService:
 
     @staticmethod
     def _start_time(game: dict[str, Any]) -> str:
-        date = game.get("date") or game.get("datetime") or ""
-        return str(date)
+        return str(game.get("date") or game.get("datetime") or "")
 
     def to_match(self, game: dict[str, Any], markets: tuple[Market, ...] = ()) -> Match:
         home, away = self._teams(game)
@@ -62,11 +60,12 @@ class KHLService:
             for item in values:
                 name = str(item.get("value") or item.get("name") or "").strip()
                 odd = self._odd(item.get("odd") or item.get("price") or item.get("odds"))
-                if name and odd and odd > 1.0:
-                    handicap = item.get("handicap")
-                    if handicap not in (None, ""):
-                        name = f"{name} {handicap}"
-                    parsed.append((name, odd))
+                if not name or odd is None or odd <= 1.0:
+                    continue
+                handicap = item.get("handicap") or item.get("line")
+                if handicap not in (None, ""):
+                    name = f"{name} {handicap}"
+                parsed.append((name, odd))
 
             if len(parsed) < 2:
                 continue
@@ -77,15 +76,46 @@ class KHLService:
 
             for name, odd in parsed:
                 probability = (1.0 / odd) / denominator
-                markets.append(Market(name=f"{market_name}: {name}", odds=odd, probability=probability))
+                markets.append(
+                    Market(
+                        name=f"{market_name}: {name}",
+                        odds=odd,
+                        probability=probability,
+                    )
+                )
 
-        # Keep the best price for duplicate market selections and limit the UI.
+        # Keep the best available price for duplicate selections.
         best: dict[str, Market] = {}
         for market in markets:
-            old = best.get(market.name)
-            if old is None or market.odds > old.odds:
+            previous = best.get(market.name)
+            if previous is None or market.odds > previous.odds:
                 best[market.name] = market
-        return tuple(sorted(best.values(), key=lambda m: m.value_percent, reverse=True)[:30])
+
+        return tuple(
+            sorted(best.values(), key=lambda m: m.value_percent, reverse=True)[:30]
+        )
+
+    @staticmethod
+    def signal_score(market: Market) -> float:
+        """Transparent 0-10 score for prioritizing lines, not a guarantee."""
+        probability = market.probability * 100
+        value = market.value_percent
+        score = 0.0
+        score += min(max((probability - 50.0) / 4.0, 0.0), 5.0)
+        score += min(max(value / 3.0, 0.0), 4.0)
+        if 1.55 <= market.odds <= 2.30:
+            score += 1.0
+        return round(min(score, 10.0), 1)
+
+    @staticmethod
+    def confidence_label(score: float) -> str:
+        if score >= 8.0:
+            return "🔥 Высокий"
+        if score >= 6.0:
+            return "🟢 Хороший"
+        if score >= 4.0:
+            return "🟡 Средний"
+        return "⚪ Осторожно"
 
     @staticmethod
     def _odd(value: Any) -> float | None:
@@ -95,7 +125,9 @@ class KHLService:
             return None
 
     @staticmethod
-    def _extract_bookmaker_bets(payload: dict[str, Any]) -> list[tuple[str, list[dict[str, Any]]]]:
+    def _extract_bookmaker_bets(
+        payload: dict[str, Any],
+    ) -> list[tuple[str, list[dict[str, Any]]]]:
         result = payload.get("response") or []
         if isinstance(result, dict):
             result = [result]
@@ -119,18 +151,30 @@ class KHLService:
             f"🏆 {match.league}"
         )
 
-    @staticmethod
-    def format_markets(match: Match) -> str:
+    @classmethod
+    def format_markets(cls, match: Match) -> str:
         if not match.markets:
             return "\n\nЛиния пока недоступна."
 
-        lines = ["\n📈 <b>Линии</b>"]
-        for index, market in enumerate(match.markets[:12], 1):
+        ranked = sorted(
+            match.markets,
+            key=lambda market: cls.signal_score(market),
+            reverse=True,
+        )
+        lines = ["\n📈 <b>Лучшие линии</b>"]
+        for index, market in enumerate(ranked[:15], 1):
             value_sign = "+" if market.value_percent >= 0 else ""
+            score = cls.signal_score(market)
+            label = cls.confidence_label(score)
             lines.append(
-                f"{index}. {market.name}\n"
+                f"{index}. <b>{market.name}</b>\n"
                 f"   КФ {market.odds:.2f} • вероятность {market.probability * 100:.1f}%\n"
-                f"   Fair {market.fair_odds:.2f} • Value {value_sign}{market.value_percent:.1f}%"
+                f"   Fair {market.fair_odds:.2f} • Value {value_sign}{market.value_percent:.1f}%\n"
+                f"   Сигнал {score:.1f}/10 • {label}"
             )
-        lines.append("\n<i>Вероятность здесь — нормализованная рыночная оценка по доступным котировкам, а не результат обученной модели.</i>")
+
+        lines.append(
+            "\n<i>Вероятность — нормализованная рыночная оценка по доступным котировкам. "
+            "Это базовый рейтинг, а не обученная ML-модель и не гарантия исхода.</i>"
+        )
         return "\n".join(lines)
