@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
+import re
 
 from .models import Market, Match, Sport
 from .providers.api_sports import ApiSportsClient
@@ -139,10 +140,28 @@ class KHLService:
         return collected
 
     @staticmethod
-    def translate_market(name: str) -> str:
+    def _replace_phrases(text: str, replacements: dict[str, str]) -> str:
+        """Заменяет английские названия рынков без учета регистра."""
+        result = text
+        for source, target in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
+            result = re.sub(re.escape(source), target, result, flags=re.IGNORECASE)
+        return result
+
+    @classmethod
+    def translate_market(cls, name: str) -> str:
         text = name.strip()
-        lower = text.lower()
         replacements = {
+            "match ends in regular time": "Матч завершится в основное время",
+            "match ends in over time": "Матч завершится в дополнительное время",
+            "either team win by 3 goal": "Любая команда выиграет в 3 шайбы",
+            "either team wins by 3 goals": "Любая команда выиграет в 3 шайбы",
+            "away team will score a goal": "Гости забьют хотя бы одну шайбу",
+            "home team will score a goal": "Хозяева забьют хотя бы одну шайбу",
+            "team to score first": "Кто забьёт первым",
+            "team to score last": "Кто забьёт последним",
+            "both teams to score": "Обе команды забьют",
+            "3way result": "Исход",
+            "3 way result": "Исход",
             "moneyline": "Победитель матча",
             "match winner": "Победитель матча",
             "winner": "Победитель матча",
@@ -151,22 +170,24 @@ class KHLService:
             "double chance": "Двойной исход",
             "handicap": "Фора",
             "puck line": "Фора по шайбам",
-            "total": "Тотал",
             "goals over/under": "Тотал шайб",
             "goals over under": "Тотал шайб",
-            "period": "Период",
+            "odd/even": "Чёт / нечёт",
+            "odd even": "Чёт / нечёт",
             "1st period": "1-й период",
             "2nd period": "2-й период",
             "3rd period": "3-й период",
-            "odd/even": "Чёт / нечёт",
-            "odd even": "Чёт / нечёт",
-            "both teams to score": "Обе команды забьют",
+            "1st period result": "Исход 1-го периода",
+            "2nd period result": "Исход 2-го периода",
+            "3rd period result": "Исход 3-го периода",
+            "period": "Период",
+            "total": "Тотал",
+            "home odd/even": "Хозяева — чёт / нечёт",
+            "away odd/even": "Гости — чёт / нечёт",
+            "home odd even": "Хозяева — чёт / нечёт",
+            "away odd even": "Гости — чёт / нечёт",
         }
-        for source, target in replacements.items():
-            if lower == source or source in lower:
-                text = text.replace(source, target).replace(source.title(), target)
-                break
-        return text
+        return cls._replace_phrases(text, replacements)
 
     @staticmethod
     def translate_outcome(name: str) -> str:
