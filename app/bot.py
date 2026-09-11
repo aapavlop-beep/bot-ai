@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+import asyncio
+
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -5,6 +9,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from .ai_predictor import AIPredictor
 from .config import settings
 from .khl import KHLService
 from .keyboards import main_menu
@@ -15,6 +20,11 @@ from .storage import PredictionStore
 dp = Dispatcher()
 store = PredictionStore(settings.database_path)
 khl = KHLService(ApiSportsClient(settings.api_sports_key)) if settings.api_sports_key else None
+ai_predictor = (
+    AIPredictor(settings.openai_api_key, settings.openai_model)
+    if settings.openai_api_key
+    else None
+)
 
 
 def khl_games_keyboard(games: list[dict]) -> InlineKeyboardMarkup:
@@ -82,7 +92,7 @@ async def callbacks(callback: CallbackQuery) -> None:
             text = (
                 "ℹ️ <b>О боте</b>\n\n"
                 "Бот собирает спортивные данные, рассчитывает вероятности "
-                "и сравнивает их с коэффициентами.\n\n"
+                "и использует ИИ для итогового прогноза.\n\n"
                 "Сейчас запускаем первый полноценный раздел — КХЛ."
             )
             markup = main_menu()
@@ -122,6 +132,22 @@ async def callbacks(callback: CallbackQuery) -> None:
                     markets = await khl.markets_for_game(game_id)
                     match = khl.to_match(game, markets)
                     text = khl.format_game(match) + khl.format_markets(match)
+
+                    if ai_predictor is not None:
+                        try:
+                            prediction = await asyncio.to_thread(ai_predictor.predict, match)
+                            text += AIPredictor.format(prediction)
+                        except Exception as exc:
+                            text += (
+                                "\n\n⚠️ <b>ИИ-прогноз временно недоступен.</b>\n"
+                                f"Причина: {exc}"
+                            )
+                    else:
+                        text += (
+                            "\n\n🤖 <b>ИИ-прогноз</b>\n"
+                            "Для него добавь OPENAI_API_KEY в локальный .env."
+                        )
+
                     markup = back_khl_keyboard()
 
         elif data.startswith("sport:"):
