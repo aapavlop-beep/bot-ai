@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 from openai import OpenAI
 
 from .models import Match
@@ -39,16 +40,25 @@ class AIPredictor:
     def __init__(self, api_key: str | None, model: str, base_url: str | None = None) -> None:
         if not api_key:
             raise ValueError("OPENAI_API_KEY не указан в .env")
-        client_kwargs = {"api_key": api_key}
+
+        # Для dindindon используем обычный HTTP/1.1-клиент без системного proxy.
+        # Curl к тому же endpoint работает, поэтому отключаем возможное влияние
+        # HTTP(S)_PROXY из окружения Windows и не используем HTTP/2.
+        http_client = httpx.Client(
+            http2=False,
+            trust_env=False,
+            timeout=httpx.Timeout(90.0, connect=20.0),
+        )
+        client_kwargs = {
+            "api_key": api_key,
+            "http_client": http_client,
+        }
         if base_url:
             client_kwargs["base_url"] = base_url
         self.client = OpenAI(**client_kwargs)
         self.model = model
 
     def _request(self, payload: dict) -> dict:
-        # Провайдер dindindon предоставляет OpenAI-compatible /chat/completions.
-        # Не используем Responses API, так как через него этот провайдер отвечает
-        # нестабильно/не поддерживает нужный endpoint.
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
@@ -126,7 +136,6 @@ class AIPredictor:
 
         selected = next((market for market in match.markets if market.name == pick), None)
 
-        # Если модель вернула неизвестную линию, безопасно превращаем результат в "ставки нет".
         if selected is None:
             recommended = False
             pick = "СТАВКИ НЕТ"
@@ -138,8 +147,6 @@ class AIPredictor:
             fair_odds = 100 / probability if probability > 0 else 0.0
             value_percent = (odds * probability / 100 - 1) * 100
 
-            # Не показываем рекомендацию с отрицательным/нулевым value,
-            # даже если модель по ошибке выставила recommended=true.
             if value_percent <= 0:
                 recommended = False
 
