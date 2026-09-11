@@ -6,13 +6,15 @@ import re
 
 from .models import Market, Match, Sport
 from .providers.api_sports import ApiSportsClient
+from .providers.khl_hockeytech import KHLHockeyTechClient
 
 
 class KHLService:
-    """Данные КХЛ, русификация рынков и контекст для ИИ."""
+    """Данные КХЛ, линии, русификация и спортивный контекст для ИИ."""
 
     def __init__(self, client: ApiSportsClient) -> None:
         self.client = client
+        self.khl_data = KHLHockeyTechClient()
 
     async def today_games(self) -> list[dict[str, Any]]:
         today = datetime.now(timezone.utc).date().isoformat()
@@ -69,40 +71,101 @@ class KHLService:
         )
 
     async def analysis_for_game(self, game: dict[str, Any]) -> dict[str, Any]:
-        """Собирает сезонную статистику и последние завершённые матчи обеих команд.
+        """Собирает спортивный контекст из двух источников.
 
-        Если отдельный endpoint недоступен, не ломает прогноз: возвращает только
-        те данные, которые удалось получить.
+        API-Sports остаётся источником линий и базовой статистики. Бесплатный
+        KHL/HockeyTech proxy используется как специализированный резерв для
+        формы, истории, очных встреч и таблицы. Ошибка одного источника не
+        отключает второй.
         """
+        home, away = self._teams(game)
         league_id = self._league_id(game)
         season = self._season(game)
-        context: dict[str, Any] = {"источник": "API-Sports", "сезон": season}
+        context: dict[str, Any] = {
+            "источники": ["API-Sports", "KHL HockeyTech"],
+            "сезон": season,
+        }
 
         for side, label in (("home", "хозяева"), ("away", "гости")):
             team_id = self._team_id(game, side)
-            if team_id is None:
-                continue
-
             team_context: dict[str, Any] = {}
-            try:
-                stats = await self.client.hockey_statistics(team_id, league=league_id, season=season)
-                if stats:
-                    team_context["сезонная_статистика"] = self._compact_team_stats(stats[0])
-            except Exception as exc:
-                team_context["ошибка_статистики"] = type(exc).__name__
+
+            if team_id is not None:
+                try:
+                    stats = await self.client.hockey_statistics(team_id, league=league_id, season=season)
+                    if stats:
+                        team_context["сезонная_статистика_api_sports"] = self._compact_team_stats(stats[0])
+                except Exception as exc:
+                    team_context["ошибка_статистики_api_sports"] = type(exc).__name__
+
+                try:
+                    history = await self.client.hockey_games(team=team_id, league=league_id, season=season)
+                    completed = [g for g in history if self._is_completed(g)]
+                    completed.sort(key=lambda item: str(item.get("date") or ""), reverse=True)
+                    team_context["последние_матчи_api_sports"] = [self._compact_game(g, team_id) for g in completed[:10]]
+                    team_context["форма_api_sports"] = self._form_summary(completed[:10], team_id)
+                except Exception as exc:
+                    team_context["ошибка_истории_api_sports"] = type(exc).__name__
 
             try:
-                history = await self.client.hockey_games(team=team_id, league=league_id, season=season)
-                completed = [g for g in history if self._is_completed(g)]
-                completed.sort(key=lambda item: str(item.get("date") or ""), reverse=True)
-                team_context["последние_матчи"] = [self._compact_game(g, team_id) for g in completed[:10]]
-                team_context["форма_последних_10"] = self._form_summary(completed[:10], team_id)
+                team_context["последние_матчи_khl"] = await self.khl_data.recent_team_games(label == "хозяева" and home or away, days=45, limit=10)
             except Exception as exc:
-                team_context["ошибка_истории"] = type(exc).__name__
+                team_context["ошибка_истории_khl"] = type(exc).__name__
 
             context[label] = team_context
 
+        try:
+            context["очные_встречи_khl"] = await self.khl_data.head_to_head(home, away, days=365, limit=10)
+        except Exception as exc:
+            context["ошибка_очных_khl"] = type(exc).__name__
+
+        try:
+            seasons_payload = await self.khl_data.seasons()
+            season_id = KHLHockeyTechClient.season_id_from_payload(seasons_payload)
+            if season_id is not None:
+                standings_payload = await self.khl_data.standings(season_id)
+                context["турнирная_таблица_khl"] = self._compact_khl_items(standings_payload, limit=30)
+                context["khl_season_id"] = season_id
+        except Exception as exc:
+            context["ошибка_таблицы_khl"] = type(exc).__name__
+
         return context
+
+    @staticmethod
+    def _compact_khl_items(payload: Any, limit: int = 30) -> list[dict[str, Any]]:
+        if isinstance(payload, list):
+            items = payload
+        elif isinstance(payload, dict):
+            items = []
+            for key in ("records", "standings", "teams", "data", "rows", "SiteKit"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    items = value
+                    break
+                if isinstance(value, dict):
+                    for nested in value.values():
+                        if isinstance(nested, list):
+                            items = nested
+                            break
+                    if items:
+                        break
+        else:
+            items = []
+        result: list[dict[str, Any]] = []
+        for item in items[:limit]:
+            if not isinstance(item, dict):
+                continue
+            compact: dict[str, Any] = {}
+            for key, value in item.items():
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    compact[str(key)] = value
+                elif isinstance(value, dict):
+                    nested = {str(k): v for k, v in value.items() if isinstance(v, (str, int, float, bool)) or v is None}
+                    if nested:
+                        compact[str(key)] = nested
+            if compact:
+                result.append(compact)
+        return result
 
     @staticmethod
     def _is_completed(game: dict[str, Any]) -> bool:
@@ -178,7 +241,6 @@ class KHLService:
 
     @staticmethod
     def _compact_team_stats(raw: Any) -> dict[str, Any]:
-        """Оставляет только числовые/структурные показатели, полезные ИИ."""
         if not isinstance(raw, dict):
             return {}
         response = raw.get("response") if isinstance(raw.get("response"), dict) else raw
@@ -306,8 +368,8 @@ class KHLService:
         replacements = {
             "match ends in regular time": "Матч завершится в основное время",
             "match ends in over time": "Матч завершится в дополнительное время",
-            "either team win by 3 goal": "Любая команда выиграет в 3 шайбы",
-            "either team wins by 3 goals": "Любая команда выиграет в 3 шайбы",
+            "either team win by": "Любая команда выиграет с разницей",
+            "either team wins by": "Любая команда выиграет с разницей",
             "away team will score a goal": "Гости забьют хотя бы одну шайбу",
             "home team will score a goal": "Хозяева забьют хотя бы одну шайбу",
             "team to score first": "Кто забьёт первым",
@@ -340,7 +402,9 @@ class KHLService:
             "home odd even": "Хозяева — чёт / нечёт",
             "away odd even": "Гости — чёт / нечёт",
         }
-        return cls._replace_phrases(text, replacements)
+        translated = cls._replace_phrases(text, replacements)
+        translated = re.sub(r"Любая команда выиграет с разницей\s*(\d+)\s*goal[s]?", r"Любая команда выиграет с разницей \1 шайбы", translated, flags=re.IGNORECASE)
+        return translated
 
     @staticmethod
     def translate_outcome(name: str) -> str:
