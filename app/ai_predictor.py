@@ -18,12 +18,15 @@ class AIPrediction:
 
 
 class AIPredictor:
-    """Спортивный аналитик через официальный OpenAI Responses API."""
+    """Спортивный аналитик через OpenAI-совместимый Responses API."""
 
-    def __init__(self, api_key: str | None, model: str) -> None:
+    def __init__(self, api_key: str | None, model: str, base_url: str | None = None) -> None:
         if not api_key:
             raise ValueError("OPENAI_API_KEY не указан в .env")
-        self.client = OpenAI(api_key=api_key)
+        client_kwargs = {"api_key": api_key}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        self.client = OpenAI(**client_kwargs)
         self.model = model
 
     def _request(self, payload: dict) -> dict:
