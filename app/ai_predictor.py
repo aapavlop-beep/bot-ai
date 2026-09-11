@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 
 import httpx
-from openai import OpenAI
 
 from .models import Match
 
@@ -41,62 +40,81 @@ class AIPredictor:
         if not api_key:
             raise ValueError("OPENAI_API_KEY не указан в .env")
 
-        # Для dindindon используем обычный HTTP/1.1-клиент без системного proxy.
-        # Curl к тому же endpoint работает, поэтому отключаем возможное влияние
-        # HTTP(S)_PROXY из окружения Windows и не используем HTTP/2.
-        http_client = httpx.Client(
+        self.api_key = api_key
+        self.model = model
+        self.base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
+
+        # Используем прямой HTTP-запрос вместо OpenAI SDK. Это исключает
+        # проблемы SDK/proxy/DNS, которые проявлялись на Windows.
+        self.http_client = httpx.Client(
             http2=False,
             trust_env=False,
             timeout=httpx.Timeout(90.0, connect=20.0),
         )
-        client_kwargs = {
-            "api_key": api_key,
-            "http_client": http_client,
-        }
-        if base_url:
-            client_kwargs["base_url"] = base_url
-        self.client = OpenAI(**client_kwargs)
-        self.model = model
 
     def _request(self, payload: dict) -> dict:
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Ты автономный спортивный аналитик и модель оценки вероятностей. "
-                        "Отвечай только на русском языке. Анализируй только переданные данные. "
-                        "Никогда не выдумывай форму команд, травмы, составы, очные встречи, новости "
-                        "или другую статистику, которой нет во входных данных. "
-                        "Для каждой выбранной линии сначала оцени истинную вероятность исхода САМОСТОЯТЕЛЬНО, "
-                        "а не копируй market_probability. Затем сравни свою вероятность с коэффициентом. "
-                        "Справедливый коэффициент = 100 / твоя вероятность в процентах. "
-                        "Value = (коэффициент * твоя вероятность как доля) - 1, в процентах. "
-                        "Выбирай только существующую линию из доступных_линий и возвращай ее точное имя. "
-                        "Если ни одна линия не имеет положительного и достаточно надежного value, "
-                        "не заставляй себя выбирать ставку: recommended=false и pick=СТАВКИ НЕТ. "
-                        "Отрицательное value не является выгодной ставкой. "
-                        "Не называй ставку гарантированной. Вероятность всегда должна быть от 0 до 100, "
-                        "уверенность от 0 до 10. Не используй 90%+ без исключительно сильных оснований. "
-                        "При отсутствии спортивной статистики снижай уверенность и явно указывай ограничение данных. "
-                        "Верни ТОЛЬКО валидный JSON без markdown и без пояснений вне JSON. "
-                        "Поля JSON: pick (string), recommended (boolean), probability (number), "
-                        "confidence (number), reason (string), alternatives (array из строк, максимум 3), "
-                        "caution (string)."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(payload, ensure_ascii=False),
-                },
-            ],
-            temperature=0.2,
-            max_tokens=1400,
+        url = f"{self.base_url}/chat/completions"
+        response = self.http_client.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Ты автономный спортивный аналитик и модель оценки вероятностей. "
+                            "Отвечай только на русском языке. Анализируй только переданные данные. "
+                            "Никогда не выдумывай форму команд, травмы, составы, очные встречи, новости "
+                            "или другую статистику, которой нет во входных данных. "
+                            "Для каждой выбранной линии сначала оцени истинную вероятность исхода САМОСТОЯТЕЛЬНО, "
+                            "а не копируй market_probability. Затем сравни свою вероятность с коэффициентом. "
+                            "Справедливый коэффициент = 100 / твоя вероятность в процентах. "
+                            "Value = (коэффициент * твоя вероятность как доля) - 1, в процентах. "
+                            "Выбирай только существующую линию из доступных_линий и возвращай ее точное имя. "
+                            "Если ни одна линия не имеет положительного и достаточно надежного value, "
+                            "не заставляй себя выбирать ставку: recommended=false и pick=СТАВКИ НЕТ. "
+                            "Отрицательное value не является выгодной ставкой. "
+                            "Не называй ставку гарантированной. Вероятность всегда должна быть от 0 до 100, "
+                            "уверенность от 0 до 10. Не используй 90%+ без исключительно сильных оснований. "
+                            "При отсутствии спортивной статистики снижай уверенность и явно указывай ограничение данных. "
+                            "Верни ТОЛЬКО валидный JSON без markdown и без пояснений вне JSON. "
+                            "Поля JSON: pick (string), recommended (boolean), probability (number), "
+                            "confidence (number), reason (string), alternatives (array из строк, максимум 3), "
+                            "caution (string)."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(payload, ensure_ascii=False),
+                    },
+                ],
+                # Не передаем temperature: dindindon гарантированно принимает
+                # тот же набор параметров, который уже проверен через curl.
+                "max_tokens": 1400,
+            },
         )
 
-        content = response.choices[0].message.content or ""
-        return json.loads(content)
+        if response.status_code >= 400:
+            try:
+                error_body = response.json()
+            except ValueError:
+                error_body = response.text[:1000]
+            raise RuntimeError(f"AI API HTTP {response.status_code}: {error_body}")
+
+        try:
+            body = response.json()
+            content = body["choices"][0]["message"]["content"] or ""
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(f"Некорректный ответ AI API: {response.text[:1000]}") from exc
+
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"ИИ вернул невалидный JSON: {content[:1000]}") from exc
 
     def predict(self, match: Match) -> AIPrediction:
         markets = [
