@@ -34,7 +34,7 @@ class AIPrediction:
 
 
 class AIPredictor:
-    """Спортивный аналитик через OpenAI-совместимый Responses API."""
+    """Спортивный аналитик через OpenAI-совместимый Chat Completions API."""
 
     def __init__(self, api_key: str | None, model: str, base_url: str | None = None) -> None:
         if not api_key:
@@ -46,64 +46,47 @@ class AIPredictor:
         self.model = model
 
     def _request(self, payload: dict) -> dict:
-        response = self.client.responses.create(
+        # Провайдер dindindon предоставляет OpenAI-compatible /chat/completions.
+        # Не используем Responses API, так как через него этот провайдер отвечает
+        # нестабильно/не поддерживает нужный endpoint.
+        response = self.client.chat.completions.create(
             model=self.model,
-            reasoning={"effort": "low"},
-            instructions=(
-                "Ты автономный спортивный аналитик и модель оценки вероятностей. "
-                "Отвечай только на русском языке. Анализируй только переданные данные. "
-                "Никогда не выдумывай форму команд, травмы, составы, очные встречи, новости "
-                "или другую статистику, которой нет во входных данных. "
-                "Для каждой выбранной линии сначала оцени истинную вероятность исхода САМОСТОЯТЕЛЬНО, "
-                "а не копируй market_probability. Затем сравни свою вероятность с коэффициентом. "
-                "Справедливый коэффициент = 100 / твоя вероятность в процентах. "
-                "Value = (коэффициент * твоя вероятность как доля) - 1, в процентах. "
-                "Выбирай только существующую линию из доступных_линий и возвращай ее точное имя. "
-                "Если ни одна линия не имеет положительного и достаточно надежного value, "
-                "не заставляй себя выбирать ставку: recommended=false и pick=\"СТАВКИ НЕТ\". "
-                "Отрицательное value не является выгодной ставкой. "
-                "Не называй ставку гарантированной. Вероятность всегда должна быть от 0 до 100, "
-                "уверенность от 0 до 10. Не используй 90%+ без исключительно сильных оснований. "
-                "При отсутствии спортивной статистики снижай уверенность и явно указывай ограничение данных."
-            ),
-            input=json.dumps(payload, ensure_ascii=False),
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "sports_prediction",
-                    "strict": True,
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "pick": {"type": "string"},
-                            "recommended": {"type": "boolean"},
-                            "probability": {"type": "number", "minimum": 0, "maximum": 100},
-                            "confidence": {"type": "number", "minimum": 0, "maximum": 10},
-                            "reason": {"type": "string"},
-                            "alternatives": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "maxItems": 3,
-                            },
-                            "caution": {"type": "string"},
-                        },
-                        "required": [
-                            "pick",
-                            "recommended",
-                            "probability",
-                            "confidence",
-                            "reason",
-                            "alternatives",
-                            "caution",
-                        ],
-                        "additionalProperties": False,
-                    },
-                }
-            },
-            max_output_tokens=1400,
-            store=False,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты автономный спортивный аналитик и модель оценки вероятностей. "
+                        "Отвечай только на русском языке. Анализируй только переданные данные. "
+                        "Никогда не выдумывай форму команд, травмы, составы, очные встречи, новости "
+                        "или другую статистику, которой нет во входных данных. "
+                        "Для каждой выбранной линии сначала оцени истинную вероятность исхода САМОСТОЯТЕЛЬНО, "
+                        "а не копируй market_probability. Затем сравни свою вероятность с коэффициентом. "
+                        "Справедливый коэффициент = 100 / твоя вероятность в процентах. "
+                        "Value = (коэффициент * твоя вероятность как доля) - 1, в процентах. "
+                        "Выбирай только существующую линию из доступных_линий и возвращай ее точное имя. "
+                        "Если ни одна линия не имеет положительного и достаточно надежного value, "
+                        "не заставляй себя выбирать ставку: recommended=false и pick=СТАВКИ НЕТ. "
+                        "Отрицательное value не является выгодной ставкой. "
+                        "Не называй ставку гарантированной. Вероятность всегда должна быть от 0 до 100, "
+                        "уверенность от 0 до 10. Не используй 90%+ без исключительно сильных оснований. "
+                        "При отсутствии спортивной статистики снижай уверенность и явно указывай ограничение данных. "
+                        "Верни ТОЛЬКО валидный JSON без markdown и без пояснений вне JSON. "
+                        "Поля JSON: pick (string), recommended (boolean), probability (number), "
+                        "confidence (number), reason (string), alternatives (array из строк, максимум 3), "
+                        "caution (string)."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(payload, ensure_ascii=False),
+                },
+            ],
+            temperature=0.2,
+            max_tokens=1400,
         )
-        return json.loads(response.output_text)
+
+        content = response.choices[0].message.content or ""
+        return json.loads(content)
 
     def predict(self, match: Match) -> AIPrediction:
         markets = [
