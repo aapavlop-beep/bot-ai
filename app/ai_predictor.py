@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-import httpx
+from openai import OpenAI
 
 from .models import Match
 
@@ -18,56 +18,61 @@ class AIPrediction:
 
 
 class AIPredictor:
-    """Локальный ИИ-аналитик через Ollama. Интернет/OpenAI API для ИИ не нужен."""
+    """Спортивный аналитик через официальный OpenAI Responses API."""
 
-    def __init__(self, base_url: str, model: str) -> None:
-        self.base_url = base_url.rstrip("/")
+    def __init__(self, api_key: str | None, model: str) -> None:
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY не указан в .env")
+        self.client = OpenAI(api_key=api_key)
         self.model = model
 
     def _request(self, payload: dict) -> dict:
-        url = f"{self.base_url}/api/chat"
-        with httpx.Client(timeout=180.0) as client:
-            response = client.post(
-                url,
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "Ты автономный спортивный аналитик. Отвечай только на русском языке. "
-                                "Анализируй только переданные данные и не выдумывай факты. "
-                                "Ты можешь выбрать только одну основную ставку. "
-                                "Вероятность должна быть реалистичной оценкой, а не гарантией. "
-                                "Не используй 90%+ без исключительных оснований. "
-                                "Если данных недостаточно, снижай уверенность. "
-                                "Не называй ставку гарантированной. Верни только JSON без markdown."
-                            ),
-                        },
-                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                    ],
-                    "stream": False,
-                    "think": False,
-                    "format": {
+        response = self.client.responses.create(
+            model=self.model,
+            reasoning={"effort": "low"},
+            instructions=(
+                "Ты автономный спортивный аналитик. Отвечай только на русском языке. "
+                "Анализируй только переданные данные и не выдумывай факты. "
+                "Выбери одну основную ставку только из доступных линий. "
+                "Вероятность — оценка, а не гарантия. Не используй 90%+ без исключительных оснований. "
+                "Если данных недостаточно, снижай уверенность. Никогда не называй ставку гарантированной."
+            ),
+            input=json.dumps(payload, ensure_ascii=False),
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "sports_prediction",
+                    "strict": True,
+                    "schema": {
                         "type": "object",
                         "properties": {
                             "pick": {"type": "string"},
                             "probability": {"type": "number"},
                             "confidence": {"type": "number"},
                             "reason": {"type": "string"},
-                            "alternatives": {"type": "array", "items": {"type": "string"}},
+                            "alternatives": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 3,
+                            },
                             "caution": {"type": "string"},
                         },
-                        "required": ["pick", "probability", "confidence", "reason", "alternatives", "caution"],
+                        "required": [
+                            "pick",
+                            "probability",
+                            "confidence",
+                            "reason",
+                            "alternatives",
+                            "caution",
+                        ],
+                        "additionalProperties": False,
                     },
-                    "options": {"temperature": 0.15},
-                },
-            )
-            response.raise_for_status()
-            body = response.json()
-            message = body.get("message") or {}
-            content = message.get("content") or "{}"
-            return json.loads(content)
+                }
+            },
+            max_output_tokens=1200,
+            store=False,
+        )
+        return json.loads(response.output_text)
 
     def predict(self, match: Match) -> AIPrediction:
         markets = [
