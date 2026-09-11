@@ -12,6 +12,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from .ai_predictor import AIPredictor
 from .config import settings
 from .khl import KHLService
+from .khl_schedule import verified_today_games
 from .keyboards import main_menu
 from .providers.api_sports import ApiSportsClient, ApiSportsError
 from .storage import PredictionStore
@@ -25,13 +26,15 @@ ai_predictor = AIPredictor(settings.openai_api_key, settings.openai_model, setti
 
 def khl_games_keyboard(games: list[dict]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    for game in games[:15]:
+    for index, game in enumerate(games[:15]):
         game_id = game.get("id")
         teams = game.get("teams") or {}
         home = (teams.get("home") or {}).get("name") or "Хозяева"
         away = (teams.get("away") or {}).get("name") or "Гости"
         if game_id is not None:
             rows.append([InlineKeyboardButton(text=f"{home} — {away}", callback_data=f"khl:game:{game_id}")])
+        else:
+            rows.append([InlineKeyboardButton(text=f"⚠️ {home} — {away}", callback_data=f"khl:missing:{index}")])
     rows.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -115,13 +118,23 @@ async def callbacks(callback: CallbackQuery) -> None:
                 text = "🏒 <b>КХЛ</b>\n\nНе указан API_SPORTS_KEY в локальном .env."
                 markup = main_menu()
             else:
-                games = await khl.today_games()
+                games = await verified_today_games(khl.client)
                 if not games:
-                    text = "🏒 <b>КХЛ</b>\n\nНа текущую дату матчи КХЛ не найдены или источник временно недоступен."
+                    text = "🏒 <b>КХЛ</b>\n\nНа текущую дату матчи КХЛ не найдены или источники временно недоступны."
                     markup = main_menu()
                 else:
-                    text = f"🏒 <b>КХЛ</b>\n\nМатчи на сегодня: {len(games)}\n\nВыбери матч:"
+                    schedule_only = sum(1 for game in games if game.get("__schedule_only"))
+                    suffix = f"\n⚠️ Без линии API-Sports: {schedule_only}" if schedule_only else ""
+                    text = f"🏒 <b>КХЛ</b>\n\nМатчи на сегодня: {len(games)}{suffix}\n\nВыбери матч:"
                     markup = khl_games_keyboard(games)
+
+        elif data.startswith("khl:missing:"):
+            text = (
+                "⚠️ <b>Матч найден в официальном расписании КХЛ</b>\n\n"
+                "Но API-Sports сейчас не вернул для него событие с ID, поэтому линию и прогноз ИИ получить нельзя.\n\n"
+                "Матч не удаляем из расписания — ждём, пока источник синхронизирует событие."
+            )
+            markup = back_khl_keyboard()
 
         elif data.startswith("khl:game:"):
             if khl is None:
@@ -134,7 +147,7 @@ async def callbacks(callback: CallbackQuery) -> None:
                 game_id = int(data.rsplit(":", 1)[1])
                 await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n1/5 Получаю данные матча и линию...")
 
-                games = await khl.today_games()
+                games = await verified_today_games(khl.client)
                 game = next((item for item in games if int(item.get("id", -1)) == game_id), None)
                 if game is None:
                     text = "Матч не найден. Обнови список матчей КХЛ."
