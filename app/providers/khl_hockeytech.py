@@ -12,12 +12,7 @@ class KHLHockeyTechError(RuntimeError):
 
 
 class KHLHockeyTechClient:
-    """Бесплатный адаптер к открытому KHL/HockeyTech proxy.
-
-    Использует публичный proxy puckway/shayypy без API-ключа. Источник
-    документирует расписание, таблицы, статистику игроков, play-by-play,
-    игровые события и LIVE-данные.
-    """
+    """Бесплатный адаптер к открытому KHL/HockeyTech proxy."""
 
     PROXY = "https://khl.shayy.workers.dev/?url="
     MODULEKIT = "https://lscluster.hockeytech.com/feed/"
@@ -36,10 +31,9 @@ class KHLHockeyTechClient:
         return self.PROXY + quote(target, safe="")
 
     async def _get(self, base: str, params: dict[str, Any]) -> Any:
-        url = self._url(base, params)
         try:
             async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True, trust_env=False) as client:
-                response = await client.get(url)
+                response = await client.get(self._url(base, params))
                 response.raise_for_status()
                 return response.json()
         except Exception as exc:
@@ -101,7 +95,11 @@ class KHLHockeyTechClient:
             return [x for x in payload if isinstance(x, dict)]
         if not isinstance(payload, dict):
             return []
-        for key in ("SiteKit", "sitekit", "games", "Games", "schedule", "Schedule", "data", "Data", "records", "Records", "teams", "Teams", "players", "Players"):
+        for key in (
+            "SiteKit", "sitekit", "games", "Games", "schedule", "Schedule", "data", "Data",
+            "records", "Records", "teams", "Teams", "players", "Players", "seasons", "Seasons",
+            "standings", "Standings",
+        ):
             value = payload.get(key)
             if isinstance(value, list):
                 return [x for x in value if isinstance(x, dict)]
@@ -109,7 +107,6 @@ class KHLHockeyTechClient:
                 nested = KHLHockeyTechClient._items(value)
                 if nested:
                     return nested
-        # HockeyTech sometimes wraps the useful object under a single key.
         for value in payload.values():
             if isinstance(value, list) and all(isinstance(x, dict) for x in value):
                 return value
@@ -139,13 +136,23 @@ class KHLHockeyTechClient:
         return needle in home.lower() or needle in away.lower() or home.lower() in needle or away.lower() in needle
 
     @classmethod
+    def _same_pair(cls, game: dict[str, Any], home_name: str, away_name: str) -> bool:
+        home, away = cls._game_teams(game)
+        h = home_name.strip().lower()
+        a = away_name.strip().lower()
+        return (h in home.lower() and a in away.lower()) or (a in home.lower() and h in away.lower())
+
+    @classmethod
     def compact_game(cls, game: dict[str, Any]) -> dict[str, Any]:
         home, away = cls._game_teams(game)
+        score = game.get("finalScore") or game.get("score") or game.get("gameScore") or ""
+        if isinstance(score, dict):
+            score = score.get("formatted") or score.get("display") or score
         return {
             "дата": cls._game_date(game)[:10],
             "хозяева": home,
             "гости": away,
-            "счёт": game.get("finalScore") or game.get("score") or game.get("gameScore") or "",
+            "счёт": score,
             "статус": game.get("status") or game.get("gameStatus") or "",
             "id": game.get("id") or game.get("game_id") or game.get("gameId"),
         }
@@ -155,6 +162,14 @@ class KHLHockeyTechClient:
         start = end - timedelta(days=days)
         payload = await self.games_per_day(start, end)
         games = [g for g in self._items(payload) if self._matches_team(g, team_name)]
+        games.sort(key=self._game_date, reverse=True)
+        return [self.compact_game(g) for g in games[:limit]]
+
+    async def head_to_head(self, home_name: str, away_name: str, *, days: int = 365, limit: int = 10) -> list[dict[str, Any]]:
+        end = date.today()
+        start = end - timedelta(days=days)
+        payload = await self.games_per_day(start, end)
+        games = [g for g in self._items(payload) if self._same_pair(g, home_name, away_name)]
         games.sort(key=self._game_date, reverse=True)
         return [self.compact_game(g) for g in games[:limit]]
 
@@ -175,7 +190,7 @@ class KHLHockeyTechClient:
                 score += 10
             if str(current_year + 1) in label:
                 score += 10
-            if "2026" in label:
-                score += 20
+            if f"{current_year}/{current_year + 1}" in label or f"{current_year}-{current_year + 1}" in label:
+                score += 30
             candidates.append((score, sid))
         return max(candidates)[1] if candidates else None
