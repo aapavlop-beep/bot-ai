@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 
 import httpx
 
@@ -44,72 +45,136 @@ class AIPredictor:
         self.model = model
         self.base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
 
-        # Используем прямой HTTP-запрос вместо OpenAI SDK. Это исключает
-        # проблемы SDK/proxy/DNS, которые проявлялись на Windows.
+        # Основной путь: прямой HTTP без системного proxy.
         self.http_client = httpx.Client(
             http2=False,
             trust_env=False,
             timeout=httpx.Timeout(90.0, connect=20.0),
         )
 
-    def _request(self, payload: dict) -> dict:
-        url = f"{self.base_url}/chat/completions"
-        response = self.http_client.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": self.model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Ты автономный спортивный аналитик и модель оценки вероятностей. "
-                            "Отвечай только на русском языке. Анализируй только переданные данные. "
-                            "Никогда не выдумывай форму команд, травмы, составы, очные встречи, новости "
-                            "или другую статистику, которой нет во входных данных. "
-                            "Для каждой выбранной линии сначала оцени истинную вероятность исхода САМОСТОЯТЕЛЬНО, "
-                            "а не копируй market_probability. Затем сравни свою вероятность с коэффициентом. "
-                            "Справедливый коэффициент = 100 / твоя вероятность в процентах. "
-                            "Value = (коэффициент * твоя вероятность как доля) - 1, в процентах. "
-                            "Выбирай только существующую линию из доступных_линий и возвращай ее точное имя. "
-                            "Если ни одна линия не имеет положительного и достаточно надежного value, "
-                            "не заставляй себя выбирать ставку: recommended=false и pick=СТАВКИ НЕТ. "
-                            "Отрицательное value не является выгодной ставкой. "
-                            "Не называй ставку гарантированной. Вероятность всегда должна быть от 0 до 100, "
-                            "уверенность от 0 до 10. Не используй 90%+ без исключительно сильных оснований. "
-                            "При отсутствии спортивной статистики снижай уверенность и явно указывай ограничение данных. "
-                            "Верни ТОЛЬКО валидный JSON без markdown и без пояснений вне JSON. "
-                            "Поля JSON: pick (string), recommended (boolean), probability (number), "
-                            "confidence (number), reason (string), alternatives (array из строк, максимум 3), "
-                            "caution (string)."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": json.dumps(payload, ensure_ascii=False),
-                    },
-                ],
-                # Не передаем temperature: dindindon гарантированно принимает
-                # тот же набор параметров, который уже проверен через curl.
-                "max_tokens": 1400,
-            },
-        )
+    def _curl_fallback(self, url: str, body: dict) -> dict:
+        """Резервный путь для Windows, если Python/httpx не может разрешить DNS.
 
-        if response.status_code >= 400:
-            try:
-                error_body = response.json()
-            except ValueError:
-                error_body = response.text[:1000]
-            raise RuntimeError(f"AI API HTTP {response.status_code}: {error_body}")
+        В Windows curl.exe часто использует рабочий системный DNS-стек даже тогда,
+        когда Python получает getaddrinfo/ConnectError. Сам curl ранее уже успешно
+        обращался к этому API на этой машине.
+        """
+        payload = json.dumps(body, ensure_ascii=False)
+        command = [
+            "curl.exe",
+            "-4",
+            "-sS",
+            "--connect-timeout",
+            "20",
+            "--max-time",
+            "90",
+            "-X",
+            "POST",
+            url,
+            "-H",
+            f"Authorization: Bearer {self.api_key}",
+            "-H",
+            "Content-Type: application/json",
+            "--data-binary",
+            payload,
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=100,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("Не найден curl.exe для резервного подключения к AI API") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Резервное подключение к AI API через curl превысило таймаут") from exc
+
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()[:1000]
+            raise RuntimeError(f"AI API curl error: {detail}")
 
         try:
-            body = response.json()
-            content = body["choices"][0]["message"]["content"] or ""
-        except (ValueError, KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError(f"Некорректный ответ AI API: {response.text[:1000]}") from exc
+            response_body = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"AI API вернул невалидный JSON через curl: {result.stdout[:1000]}") from exc
+
+        if isinstance(response_body, dict) and "error" in response_body:
+            raise RuntimeError(f"AI API HTTP error через curl: {response_body}")
+
+        return response_body
+
+    def _request(self, payload: dict) -> dict:
+        url = f"{self.base_url}/chat/completions"
+        request_body = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты автономный спортивный аналитик и модель оценки вероятностей. "
+                        "Отвечай только на русском языке. Анализируй только переданные данные. "
+                        "Никогда не выдумывай форму команд, травмы, составы, очные встречи, новости "
+                        "или другую статистику, которой нет во входных данных. "
+                        "Для каждой выбранной линии сначала оцени истинную вероятность исхода САМОСТОЯТЕЛЬНО, "
+                        "а не копируй market_probability. Затем сравни свою вероятность с коэффициентом. "
+                        "Справедливый коэффициент = 100 / твоя вероятность в процентах. "
+                        "Value = (коэффициент * твоя вероятность как доля) - 1, в процентах. "
+                        "Выбирай только существующую линию из доступных_линий и возвращай ее точное имя. "
+                        "Если ни одна линия не имеет положительного и достаточно надежного value, "
+                        "не заставляй себя выбирать ставку: recommended=false и pick=СТАВКИ НЕТ. "
+                        "Отрицательное value не является выгодной ставкой. "
+                        "Не называй ставку гарантированной. Вероятность всегда должна быть от 0 до 100, "
+                        "уверенность от 0 до 10. Не используй 90%+ без исключительно сильных оснований. "
+                        "При отсутствии спортивной статистики снижай уверенность и явно указывай ограничение данных. "
+                        "Верни ТОЛЬКО валидный JSON без markdown и без пояснений вне JSON. "
+                        "Поля JSON: pick (string), recommended (boolean), probability (number), "
+                        "confidence (number), reason (string), alternatives (array из строк, максимум 3), "
+                        "caution (string)."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(payload, ensure_ascii=False),
+                },
+            ],
+            "max_tokens": 1400,
+        }
+
+        try:
+            response = self.http_client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=request_body,
+            )
+
+            if response.status_code >= 400:
+                try:
+                    error_body = response.json()
+                except ValueError:
+                    error_body = response.text[:1000]
+                raise RuntimeError(f"AI API HTTP {response.status_code}: {error_body}")
+
+            try:
+                body = response.json()
+                content = body["choices"][0]["message"]["content"] or ""
+            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                raise RuntimeError(f"Некорректный ответ AI API: {response.text[:1000]}") from exc
+
+        except httpx.ConnectError:
+            # На текущем Windows httpx периодически получает getaddrinfo failed,
+            # хотя curl к тому же домену работает. В таком случае используем curl.
+            body = self._curl_fallback(url, request_body)
+            try:
+                content = body["choices"][0]["message"]["content"] or ""
+            except (KeyError, IndexError, TypeError) as exc:
+                raise RuntimeError(f"Некорректный ответ AI API через curl: {str(body)[:1000]}") from exc
 
         try:
             return json.loads(content)
