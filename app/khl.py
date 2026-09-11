@@ -4,17 +4,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .models import Market, Match, Sport
-from .providers.api_sports import ApiSportsClient, ApiSportsError
+from .providers.api_sports import ApiSportsClient
 
 
 class KHLService:
-    """KHL data, market normalization and a transparent baseline model.
-
-    The baseline model is market-derived: it removes the bookmaker margin and
-    adds a conservative signal score from probability, Value and market type.
-    It is intentionally not presented as an ML model until we have enough
-    historical samples for backtesting and calibration.
-    """
+    """KHL data, market normalization and a transparent baseline model."""
 
     def __init__(self, client: ApiSportsClient) -> None:
         self.client = client
@@ -22,11 +16,7 @@ class KHLService:
     async def today_games(self) -> list[dict[str, Any]]:
         today = datetime.now(timezone.utc).date().isoformat()
         games = await self.client.hockey_games(date=today)
-        return [
-            g
-            for g in games
-            if str(g.get("league", {}).get("name", "")).strip().lower() == "khl"
-        ]
+        return [g for g in games if str(g.get("league", {}).get("name", "")).strip().lower() == "khl"]
 
     @staticmethod
     def _teams(game: dict[str, Any]) -> tuple[str, str]:
@@ -58,6 +48,8 @@ class KHLService:
         for market_name, values in raw:
             parsed: list[tuple[str, float]] = []
             for item in values:
+                if not isinstance(item, dict):
+                    continue
                 name = str(item.get("value") or item.get("name") or "").strip()
                 odd = self._odd(item.get("odd") or item.get("price") or item.get("odds"))
                 if not name or odd is None or odd <= 1.0:
@@ -69,39 +61,25 @@ class KHLService:
 
             if len(parsed) < 2:
                 continue
-
             denominator = sum(1.0 / odd for _, odd in parsed)
             if denominator <= 0:
                 continue
-
             for name, odd in parsed:
                 probability = (1.0 / odd) / denominator
-                markets.append(
-                    Market(
-                        name=f"{market_name}: {name}",
-                        odds=odd,
-                        probability=probability,
-                    )
-                )
+                markets.append(Market(name=f"{market_name}: {name}", odds=odd, probability=probability))
 
-        # Keep the best available price for duplicate selections.
         best: dict[str, Market] = {}
         for market in markets:
             previous = best.get(market.name)
             if previous is None or market.odds > previous.odds:
                 best[market.name] = market
-
-        return tuple(
-            sorted(best.values(), key=lambda m: m.value_percent, reverse=True)[:30]
-        )
+        return tuple(sorted(best.values(), key=lambda m: m.value_percent, reverse=True)[:30])
 
     @staticmethod
     def signal_score(market: Market) -> float:
-        """Transparent 0-10 score for prioritizing lines, not a guarantee."""
         probability = market.probability * 100
         value = market.value_percent
-        score = 0.0
-        score += min(max((probability - 50.0) / 4.0, 0.0), 5.0)
+        score = min(max((probability - 50.0) / 4.0, 0.0), 5.0)
         score += min(max(value / 3.0, 0.0), 4.0)
         if 1.55 <= market.odds <= 2.30:
             score += 1.0
@@ -125,18 +103,35 @@ class KHLService:
             return None
 
     @staticmethod
-    def _extract_bookmaker_bets(
-        payload: dict[str, Any],
-    ) -> list[tuple[str, list[dict[str, Any]]]]:
-        result = payload.get("response") or []
+    def _extract_bookmaker_bets(payload: Any) -> list[tuple[str, list[dict[str, Any]]]]:
+        """Normalize API-Sports odds responses whether response is dict or list."""
+        if isinstance(payload, dict):
+            result = payload.get("response") or []
+        elif isinstance(payload, list):
+            result = payload
+        else:
+            return []
         if isinstance(result, dict):
             result = [result]
+        if not isinstance(result, list):
+            return []
 
         collected: list[tuple[str, list[dict[str, Any]]]] = []
         for game in result:
+            if not isinstance(game, dict):
+                continue
             bookmakers = game.get("bookmakers") or []
+            if not isinstance(bookmakers, list):
+                continue
             for bookmaker in bookmakers:
-                for bet in bookmaker.get("bets") or bookmaker.get("markets") or []:
+                if not isinstance(bookmaker, dict):
+                    continue
+                bets = bookmaker.get("bets") or bookmaker.get("markets") or []
+                if not isinstance(bets, list):
+                    continue
+                for bet in bets:
+                    if not isinstance(bet, dict):
+                        continue
                     name = str(bet.get("name") or bet.get("key") or "Рынок")
                     values = bet.get("values") or bet.get("outcomes") or []
                     if isinstance(values, list):
@@ -145,22 +140,13 @@ class KHLService:
 
     @staticmethod
     def format_game(match: Match) -> str:
-        return (
-            f"🏒 <b>{match.home} — {match.away}</b>\n"
-            f"🕒 {match.start_time}\n"
-            f"🏆 {match.league}"
-        )
+        return f"🏒 <b>{match.home} — {match.away}</b>\n🕒 {match.start_time}\n🏆 {match.league}"
 
     @classmethod
     def format_markets(cls, match: Match) -> str:
         if not match.markets:
             return "\n\nЛиния пока недоступна."
-
-        ranked = sorted(
-            match.markets,
-            key=lambda market: cls.signal_score(market),
-            reverse=True,
-        )
+        ranked = sorted(match.markets, key=cls.signal_score, reverse=True)
         lines = ["\n📈 <b>Лучшие линии</b>"]
         for index, market in enumerate(ranked[:15], 1):
             value_sign = "+" if market.value_percent >= 0 else ""
@@ -172,9 +158,5 @@ class KHLService:
                 f"   Fair {market.fair_odds:.2f} • Value {value_sign}{market.value_percent:.1f}%\n"
                 f"   Сигнал {score:.1f}/10 • {label}"
             )
-
-        lines.append(
-            "\n<i>Вероятность — нормализованная рыночная оценка по доступным котировкам. "
-            "Это базовый рейтинг, а не обученная ML-модель и не гарантия исхода.</i>"
-        )
+        lines.append("\n<i>Вероятность — нормализованная рыночная оценка. Это базовый рейтинг, а не гарантия исхода.</i>")
         return "\n".join(lines)
