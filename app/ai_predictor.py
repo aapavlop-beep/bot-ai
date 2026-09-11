@@ -22,6 +22,7 @@ class AIPrediction:
         fair_odds: float = 0.0,
         value_percent: float = 0.0,
         recommended: bool = False,
+        status: str = "no_bet",
     ) -> None:
         self.pick = pick
         self.probability = probability
@@ -33,10 +34,20 @@ class AIPrediction:
         self.fair_odds = fair_odds
         self.value_percent = value_percent
         self.recommended = recommended
+        self.status = status
 
 
 class AIPredictor:
     """Спортивный аналитик через OpenAI-совместимый Chat Completions API."""
+
+    # Жёсткие правила финального фильтра. ИИ может найти кандидата,
+    # но бот не покажет его как ставку, если он не проходит эти условия.
+    MIN_BET_VALUE = 5.0
+    MIN_BET_CONFIDENCE = 7.0
+    MIN_BET_PROBABILITY = 55.0
+    MIN_WATCH_VALUE = 2.0
+    MIN_WATCH_CONFIDENCE = 6.0
+    MIN_WATCH_PROBABILITY = 53.0
 
     def __init__(self, api_key: str | None, model: str, base_url: str | None = None) -> None:
         if not api_key:
@@ -90,18 +101,24 @@ class AIPredictor:
                     "role": "system",
                     "content": (
                         "Ты автономный спортивный аналитик. Отвечай только на русском языке. "
+                        "Твоя задача НЕ перечислять все возможные ставки. Найди ОДНУ лучшую линию "
+                        "из доступных и оцени, заслуживает ли она внимания или реальной рекомендации. "
                         "Используй ВСЕ переданные спортивные данные: сезонную статистику, последние матчи, "
-                        "результативность, домашний/гостевой контекст и линии. "
+                        "результативность, домашний/гостевой контекст, очные встречи, таблицу и линии. "
                         "Никогда не выдумывай отсутствующие факты. Если данных мало, снижай уверенность. "
                         "Рыночная вероятность — только ориентир, не твоя вероятность. "
-                        "Для каждой выбранной линии самостоятельно оцени вероятность, затем сравни её с КФ. "
+                        "Для каждой линии, которую рассматриваешь, самостоятельно оцени вероятность. "
                         "Справедливый КФ = 100 / вероятность. Value = (КФ * вероятность как доля - 1) * 100. "
-                        "Выбирай только существующую линию из доступных_линий и возвращай точное имя. "
-                        "Рекомендуй ставку только при положительном value и достаточной уверенности. "
-                        "Если преимущества нет, recommended=false и pick=СТАВКИ НЕТ. "
+                        "Выбери только одну наиболее сильную существующую линию. Не предлагай несколько ставок. "
+                        "Если есть хороший кандидат, верни его в pick. Если ни одна линия не имеет реального преимущества, "
+                        "верни pick=СТАВКИ НЕТ. "
+                        "Статус: BET только если value >= 5%, вероятность >= 55% и уверенность >= 7/10; "
+                        "WATCH если value >= 2%, вероятность >= 53% и уверенность >= 6/10; "
+                        "во всех остальных случаях NO_BET. Эти пороги являются обязательными. "
                         "Не называй ставку гарантированной. Вероятность 0..100, уверенность 0..10. "
                         "Верни ТОЛЬКО валидный JSON без markdown. "
-                        "Поля: pick, recommended, probability, confidence, reason, alternatives, caution."
+                        "Поля: pick, status, recommended, probability, confidence, reason, alternatives, caution. "
+                        "status должен быть только BET, WATCH или NO_BET. alternatives обычно пустой массив."
                     ),
                 },
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -159,65 +176,95 @@ class AIPredictor:
             "спортивный_контекст": match.analysis_data,
             "доступные_линии": markets,
             "задача": (
-                "Оцени исходы на основе спортивного контекста и линий. "
-                "Не копируй рыночную вероятность. Найди лучшую существующую линию, "
-                "если у неё есть положительное value. При недостатке данных честно откажись. "
-                "Альтернативы также должны быть только из доступных линий."
+                "Проанализируй доступные линии и выбери только ОДНУ лучшую. "
+                "Мне нужны не все прогнозы, а только действительно сильный кандидат. "
+                "Если он проходит строгие критерии BET — это рекомендация. "
+                "Если он слабее, но заслуживает наблюдения — WATCH. "
+                "Если сильного кандидата нет — NO_BET. "
+                "Не используй рыночную вероятность как собственную оценку и не выдумывай статистику."
             ),
         }
 
         data = self._request(payload)
         probability = max(0.0, min(100.0, float(data["probability"])))
         confidence = max(0.0, min(10.0, float(data["confidence"])))
-        recommended = bool(data["recommended"])
-        pick = str(data["pick"])
-        alternatives = tuple(str(item) for item in data.get("alternatives", [])[:3])
+        pick = str(data.get("pick") or "СТАВКИ НЕТ")
+        status = str(data.get("status") or "NO_BET").upper()
+        if status not in {"BET", "WATCH", "NO_BET"}:
+            status = "NO_BET"
+
+        alternatives = tuple(str(item) for item in data.get("alternatives", [])[:1])
         selected = next((market for market in match.markets if market.name == pick), None)
 
         if selected is None:
-            recommended = False
+            status = "NO_BET"
             pick = "СТАВКИ НЕТ"
             odds = fair_odds = value_percent = 0.0
         else:
             odds = selected.odds
             fair_odds = 100 / probability if probability > 0 else 0.0
             value_percent = (odds * probability / 100 - 1) * 100
-            if value_percent <= 0:
-                recommended = False
+
+            # Финальная серверная проверка. Ответ модели не может обойти пороги.
+            if (
+                value_percent >= self.MIN_BET_VALUE
+                and probability >= self.MIN_BET_PROBABILITY
+                and confidence >= self.MIN_BET_CONFIDENCE
+            ):
+                status = "BET"
+            elif (
+                value_percent >= self.MIN_WATCH_VALUE
+                and probability >= self.MIN_WATCH_PROBABILITY
+                and confidence >= self.MIN_WATCH_CONFIDENCE
+            ):
+                status = "WATCH"
+            else:
+                status = "NO_BET"
+
+            if status == "NO_BET":
+                pick = "СТАВКИ НЕТ"
+                odds = fair_odds = value_percent = 0.0
+
+        recommended = status == "BET"
 
         return AIPrediction(
             pick=pick,
             probability=probability,
             confidence=confidence,
-            reason=str(data["reason"]),
-            alternatives=alternatives,
-            caution=str(data["caution"]),
+            reason=str(data.get("reason") or "Недостаточно данных для надёжной рекомендации."),
+            alternatives=alternatives if status != "BET" else (),
+            caution=str(data.get("caution") or "Оценка не является гарантией результата."),
             odds=odds,
             fair_odds=fair_odds,
             value_percent=value_percent,
             recommended=recommended,
+            status=status,
         )
 
     @staticmethod
     def format(prediction: AIPrediction) -> str:
-        alternatives = "\n".join(f"• {item}" for item in prediction.alternatives) or "• Нет подходящих альтернатив"
-        if prediction.recommended:
-            header = "🎯 <b>ОСНОВНОЙ ПРОГНОЗ</b>"
+        if prediction.status == "BET":
+            header = "🟢 <b>СТАВКА — ЛУЧШИЙ СИГНАЛ</b>"
+            pick = prediction.pick
+            value_line = f"📈 <b>Value ИИ:</b> {prediction.value_percent:+.1f}%"
+            odds_line = f"💰 <b>Коэффициент:</b> {prediction.odds:.2f}\n📐 <b>Справедливый КФ ИИ:</b> {prediction.fair_odds:.2f}"
+        elif prediction.status == "WATCH":
+            header = "🟡 <b>НАБЛЮДЕНИЕ — СИЛЬНЫЙ КАНДИДАТ</b>"
             pick = prediction.pick
             value_line = f"📈 <b>Value ИИ:</b> {prediction.value_percent:+.1f}%"
             odds_line = f"💰 <b>Коэффициент:</b> {prediction.odds:.2f}\n📐 <b>Справедливый КФ ИИ:</b> {prediction.fair_odds:.2f}"
         else:
-            header = "🚫 <b>СТАВКИ НЕТ</b>"
-            pick = "Нет линии с подтвержденным положительным преимуществом"
-            value_line = "📈 <b>Value:</b> недостаточно для рекомендации"
+            header = "⚪ <b>СИЛЬНОГО СИГНАЛА НЕТ</b>"
+            pick = "Нет линии, которую модель считает достаточно сильной"
+            value_line = "📈 <b>Value:</b> ниже установленного порога"
             odds_line = ""
+
         return (
             "\n\n🤖 <b>ПРОГНОЗ ИИ</b>\n\n"
             f"{header}\n🎯 <b>Выбор:</b> {pick}\n"
             f"📊 <b>Вероятность ИИ:</b> {prediction.probability:.1f}%\n"
             f"🧠 <b>Уверенность:</b> {prediction.confidence:.1f}/10\n"
             f"{odds_line}\n{value_line}\n\n"
-            f"<b>Обоснование:</b> {prediction.reason}\n\n"
-            f"<b>Альтернативы:</b>\n{alternatives}\n\n"
+            f"<b>Почему:</b> {prediction.reason}\n\n"
             f"⚠️ <i>{prediction.caution}</i>"
         )
