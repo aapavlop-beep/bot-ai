@@ -9,9 +9,9 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from .ai_predictor import AIPredictor
+from .ai_predictor_v2 import Best3AIPredictor
 from .config import settings
-from .khl import KHLService
+from .khl_enhanced import EnhancedKHLService
 from .khl_schedule import verified_today_games
 from .keyboards import main_menu
 from .providers.api_sports import ApiSportsClient, ApiSportsError
@@ -20,8 +20,8 @@ from .storage import PredictionStore
 
 dp = Dispatcher()
 store = PredictionStore(settings.database_path)
-khl = KHLService(ApiSportsClient(settings.api_sports_key)) if settings.api_sports_key else None
-ai_predictor = AIPredictor(settings.openai_api_key, settings.openai_model, settings.openai_base_url) if settings.openai_api_key else None
+khl = EnhancedKHLService(ApiSportsClient(settings.api_sports_key)) if settings.api_sports_key else None
+ai_predictor = Best3AIPredictor(settings.openai_api_key, settings.openai_model, settings.openai_base_url) if settings.openai_api_key else None
 
 
 def khl_games_keyboard(games: list[dict]) -> InlineKeyboardMarkup:
@@ -109,7 +109,7 @@ async def callbacks(callback: CallbackQuery) -> None:
         elif data == "top":
             text = (
                 "🔥 <b>Лучшие прогнозы</b>\n\n"
-                "Пока нет проверенных сигналов. Сначала собираем реальные линии и историю модели."
+                "После обновления аналитики здесь будут отображаться лучшие кандидаты по всем матчам."
             )
             markup = main_menu()
 
@@ -156,7 +156,7 @@ async def callbacks(callback: CallbackQuery) -> None:
                     await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n2/5 Получаю все доступные линии...")
                     markets = await khl.markets_for_game(game_id)
 
-                    await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n3/5 Анализирую форму команд и сезонную статистику...")
+                    await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n3/5 Получаю официальную статистику КХЛ, форму и очные встречи...")
                     analysis_data = await khl.analysis_for_game(game)
                     match = khl.to_match(game, markets, analysis_data)
 
@@ -164,18 +164,15 @@ async def callbacks(callback: CallbackQuery) -> None:
                         callback,
                         f"🏒 <b>{match.home} — {match.away}</b>\n\n"
                         f"4/5 Линий получено: <b>{len(match.markets)}</b>\n"
-                        "🤖 ИИ анализирует матч с учётом статистики...",
+                        "🤖 ИИ выбирает лучший прогноз и две сильные альтернативы...",
                     )
 
                     try:
-                        prediction = await asyncio.wait_for(
+                        predictions = await asyncio.wait_for(
                             asyncio.to_thread(ai_predictor.predict, match),
                             timeout=90.0,
                         )
-                        # Все линии анализируются внутри модели, но пользователю
-                        # показываем только итоговый сильный сигнал. Рыночный
-                        # рейтинг из 15–30 линий больше не выводится.
-                        text = khl.format_game(match) + AIPredictor.format(prediction)
+                        text = khl.format_game(match) + Best3AIPredictor.format(predictions)
                     except asyncio.TimeoutError:
                         print("AI prediction error: TimeoutError: AI did not answer within 90 seconds")
                         text = (
