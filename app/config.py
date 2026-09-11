@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
     odds_api_key: str | None = None
     odds_api_regions: str = "eu"
+    api_sports_key: str | None = None
     database_path: str = "data/bot.db"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
