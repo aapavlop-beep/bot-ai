@@ -39,83 +39,109 @@ class EnhancedKHLService(KHLService):
             + q["история_гостей"]
             + min(q["h2h"], 10)
             + (5 if q["есть_таблица"] else 0)
+            + (2 if q["есть_сезонная_статистика"] else 0)
         )
+
+    @staticmethod
+    def _api_quality(api: dict[str, Any]) -> dict[str, int | bool]:
+        home_api = api.get("хозяева") or {}
+        away_api = api.get("гости") or {}
+        h = len(home_api.get("последние_матчи_api_sports") or [])
+        a = len(away_api.get("последние_матчи_api_sports") or [])
+        return {
+            "история_хозяев": h,
+            "история_гостей": a,
+            "h2h": len(api.get("очные_встречи_khl") or []),
+            "есть_таблица": bool(api.get("турнирная_таблица_khl")),
+            "есть_сезонная_статистика": bool(
+                home_api.get("сезонная_статистика_api_sports")
+                or away_api.get("сезонная_статистика_api_sports")
+            ),
+        }
 
     async def analysis_for_game(self, game: dict[str, Any]) -> dict[str, Any]:
         home, away = self._teams(game)
         start = self._start_time(game)
         context: dict[str, Any] = {
-            "источники": ["Официальный KHL mobile API", "SofaScore", "API-Sports"],
+            "источники": ["Официальный KHL mobile API", "SofaScore", "API-Sports", "KHL HockeyTech"],
             "сезон": self._season(game),
         }
 
-        official: dict[str, Any] | None = None
+        # Collect every source independently. One provider returning an empty
+        # result must not hide useful data from another provider.
         try:
             official = await self.khl_mobile.build_match_context(home, away, start)
             context["официальные_данные_khl"] = official
         except Exception as exc:
             context["ошибка_официального_khl"] = f"{type(exc).__name__}: {exc}"
 
-        if not official or not self._usable(official):
-            try:
-                context["резервные_данные_khl"] = await self.sofascore.build_context(home, away, start)
-            except Exception as exc:
-                context["ошибка_sofascore"] = f"{type(exc).__name__}: {exc}"
+        try:
+            context["резервные_данные_khl"] = await self.sofascore.build_context(home, away, start)
+        except Exception as exc:
+            context["ошибка_sofascore"] = f"{type(exc).__name__}: {exc}"
 
         try:
-            fallback = await super().analysis_for_game(game)
-            context["резервные_данные_api_sports"] = fallback
+            context["резервные_данные_api_sports"] = await super().analysis_for_game(game)
         except Exception as exc:
             context["ошибка_резервных_данных"] = f"{type(exc).__name__}: {exc}"
 
-        # Pick the source that actually contains the most usable recent-game data.
-        candidates: list[tuple[str, dict[str, Any]]] = []
+        # HockeyTech is kept as an additional independent fallback. Its
+        # payload is not used as the sole source unless it contains real games.
+        try:
+            ht = self.khl_data
+            recent_home = await ht.recent_team_games(home, days=120, limit=10)
+            recent_away = await ht.recent_team_games(away, days=120, limit=10)
+            h2h = await ht.head_to_head(home, away, days=730, limit=10)
+            context["резервные_данные_hockeytech"] = {
+                "источник_статистики": "KHL HockeyTech",
+                "хозяева": {"команда": home, "последние_10": recent_home},
+                "гости": {"команда": away, "последние_10": recent_away},
+                "очные_встречи": h2h,
+                "качество_данных": {
+                    "история_хозяев": len(recent_home),
+                    "история_гостей": len(recent_away),
+                    "h2h": len(h2h),
+                    "есть_таблица": False,
+                    "есть_сезонная_статистика": False,
+                },
+            }
+        except Exception as exc:
+            context["ошибка_hockeytech"] = f"{type(exc).__name__}: {exc}"
+
+        candidates: list[tuple[str, dict[str, Any], int]] = []
         for key in ("официальные_данные_khl", "резервные_данные_khl"):
             data = context.get(key)
             if isinstance(data, dict):
-                candidates.append((str(data.get("источник_статистики", key)), data))
+                score = self._source_score(data)
+                if score > 0:
+                    candidates.append((str(data.get("источник_статистики", key)), data, score))
 
-        best_source = None
-        best_data = None
-        best_score = -1
-        for source, data in candidates:
-            score = self._source_score(data)
-            if score > best_score:
-                best_source, best_data, best_score = source, data, score
+        api = context.get("резервные_данные_api_sports")
+        if isinstance(api, dict):
+            q = self._api_quality(api)
+            api_score = int(q["история_хозяев"]) + int(q["история_гостей"]) + min(int(q["h2h"]), 10) + (5 if q["есть_таблица"] else 0) + (2 if q["есть_сезонная_статистика"] else 0)
+            if api_score > 0:
+                candidates.append(("API-Sports", api, api_score))
 
-        if best_data is not None and best_score > 0:
+        ht = context.get("резервные_данные_hockeytech")
+        if isinstance(ht, dict):
+            score = self._source_score(ht)
+            if score > 0:
+                candidates.append(("KHL HockeyTech", ht, score))
+
+        if candidates:
+            best_source, best_data, best_score = max(candidates, key=lambda item: item[2])
             context["активный_источник_статистики"] = best_source
             context["качество_активных_данных"] = self._quality(best_data)
         else:
-            # API-Sports can still contain real recent games even when the
-            # specialized providers fail. Mark it as usable instead of telling
-            # the model that all sports data is missing.
-            api = context.get("резервные_данные_api_sports") or {}
-            home_api = api.get("хозяева") or {}
-            away_api = api.get("гости") or {}
-            h = len(home_api.get("последние_матчи_api_sports") or [])
-            a = len(away_api.get("последние_матчи_api_sports") or [])
-            if h or a:
-                context["активный_источник_статистики"] = "API-Sports"
-                context["качество_активных_данных"] = {
-                    "история_хозяев": h,
-                    "история_гостей": a,
-                    "h2h": len(api.get("очные_встречи_khl") or []),
-                    "есть_таблица": bool(api.get("турнирная_таблица_khl")),
-                    "есть_сезонная_статистика": bool(
-                        home_api.get("сезонная_статистика_api_sports")
-                        or away_api.get("сезонная_статистика_api_sports")
-                    ),
-                }
-            else:
-                context["активный_источник_статистики"] = "нет"
-                context["качество_активных_данных"] = {
-                    "история_хозяев": 0,
-                    "история_гостей": 0,
-                    "h2h": 0,
-                    "есть_таблица": False,
-                    "есть_сезонная_статистика": False,
-                }
+            context["активный_источник_статистики"] = "нет"
+            context["качество_активных_данных"] = {
+                "история_хозяев": 0,
+                "история_гостей": 0,
+                "h2h": 0,
+                "есть_таблица": False,
+                "есть_сезонная_статистика": False,
+            }
 
         q = context["качество_активных_данных"]
         context["диагностика_статистики"] = (
