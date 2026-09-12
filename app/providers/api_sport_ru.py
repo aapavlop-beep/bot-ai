@@ -22,15 +22,22 @@ class ApiSportRuClient:
         self.timeout = timeout
 
     async def get(self, path: str, **params: Any) -> dict[str, Any]:
+        url = f"{self.BASE_URL}/{path.lstrip('/')}"
+        safe_params = {k: v for k, v in params.items() if v is not None}
+        print(f"API-SPORT.ru REQUEST: GET {url} params={safe_params}", flush=True)
         headers = {"Authorization": self.api_key, "Accept": "application/json"}
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.get(
-                f"{self.BASE_URL}/{path.lstrip('/')}",
-                headers=headers,
-                params={k: v for k, v in params.items() if v is not None},
-            )
-            response.raise_for_status()
-            payload = response.json()
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(url, headers=headers, params=safe_params)
+                print(
+                    f"API-SPORT.ru RESPONSE: GET {url} status={response.status_code} bytes={len(response.content)}",
+                    flush=True,
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except Exception as exc:
+            print(f"API-SPORT.ru ERROR: GET {url} {type(exc).__name__}: {exc}", flush=True)
+            raise
         if not isinstance(payload, dict):
             raise ApiSportRuError("API-SPORT.ru returned a non-object response")
         return payload
