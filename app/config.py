@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     odds_api_key: str | None = None
     odds_api_regions: str = "eu"
     api_sports_key: str | None = None
+    api_sport_ru_key: str | None = None
 
     # OpenAI-compatible API (official OpenAI or another compatible provider).
     openai_api_key: str | None = None
