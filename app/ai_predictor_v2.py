@@ -35,6 +35,8 @@ class Best3AIPredictor(AIPredictor):
                     "Ты профессиональный спортивный аналитик. Отвечай только на русском. "
                     "Выбери лучший прогноз и еще два сильных альтернативных прогноза. "
                     "Основывай вероятность прежде всего на переданной статистике: последние матчи, голы, домашний/гостевой контекст, H2H, таблица и составы. "
+                    "Если поле активный_источник_статистики не равно 'нет', считай переданный спортивный контекст реальными полученными данными и используй конкретные цифры из него. "
+                    "Не пиши, что статистика отсутствует, если в контексте есть последние_10, форма_10, H2H или таблица. "
                     "Коэффициент используй как дополнительный сигнал. Не выдумывай отсутствующие факты. "
                     "Вероятность должна быть независимой от рыночной, но без необоснованного отклонения более чем на 20 п.п. "
                     "Справедливый КФ = 100 / вероятность. Value = (коэффициент * вероятность / 100 - 1) * 100. "
@@ -69,14 +71,15 @@ class Best3AIPredictor(AIPredictor):
     def _data_quality(match: Match) -> float:
         official = match.analysis_data.get("официальные_данные_khl") or {}
         active = match.analysis_data.get("резервные_данные_khl") or {}
+        explicit = match.analysis_data.get("качество_активных_данных") or {}
         data = official if Best3AIPredictor._quality_count(official) >= Best3AIPredictor._quality_count(active) else active
-        quality = data.get("качество_данных") or {}
+        quality = explicit or data.get("качество_данных") or {}
         home = int(quality.get("история_хозяев") or 0)
         away = int(quality.get("история_гостей") or 0)
         h2h = int(quality.get("h2h") or 0)
         seasonal = bool(quality.get("есть_сезонная_статистика") or quality.get("есть_таблица"))
         score = 2.0
-        if data.get("источник_статистики"): score += 2.0
+        if match.analysis_data.get("активный_источник_статистики") not in (None, "нет"): score += 2.0
         if home >= 5: score += 1.5
         elif home > 0: score += 0.7
         if away >= 5: score += 1.5
@@ -93,7 +96,7 @@ class Best3AIPredictor(AIPredictor):
     def predict(self, match: Match) -> tuple[Recommendation, ...]:
         markets = [{"name": m.name, "odds": round(m.odds,4), "market_probability": round(m.probability*100,2), "market_fair_odds": round(m.fair_odds,4), "market_value_percent": round(m.value_percent,2)} for m in match.markets]
         quality = self._data_quality(match)
-        payload = {"спорт": match.sport.value, "лига": match.league, "хозяева": match.home, "гости": match.away, "начало": match.start_time, "качество_данных_0_10": quality, "спортивный_контекст": match.analysis_data, "доступные_линии": markets, "задача": "Выбери три лучших прогноза: №1 лучший, №2 и №3 альтернативы."}
+        payload = {"спорт": match.sport.value, "лига": match.league, "хозяева": match.home, "гости": match.away, "начало": match.start_time, "качество_данных_0_10": quality, "активный_источник_статистики": match.analysis_data.get("активный_источник_статистики", "нет"), "диагностика_статистики": match.analysis_data.get("диагностика_статистики", ""), "спортивный_контекст": match.analysis_data, "доступные_линии": markets, "задача": "Выбери три лучших прогноза: №1 лучший, №2 и №3 альтернативы."}
         data = self._request_v2(payload)
         raw_recs = data.get("recommendations") or []
         by_name = {m.name: m for m in match.markets}
