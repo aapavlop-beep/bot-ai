@@ -16,6 +16,7 @@ from .khl_schedule import verified_today_games
 from .keyboards import main_menu
 from .providers.api_sports import ApiSportsClient, ApiSportsError
 from .storage import PredictionStore
+from .team_names import display_team_name
 
 
 dp = Dispatcher()
@@ -24,9 +25,24 @@ khl = EnhancedKHLService(ApiSportsClient(settings.api_sports_key)) if settings.a
 ai_predictor = Best3AIPredictor(settings.openai_api_key, settings.openai_model, settings.openai_base_url) if settings.openai_api_key else None
 
 
+def normalize_game_names(game: dict) -> dict:
+    """Normalize provider-specific KHL team names before UI and analytics."""
+    teams = game.get("teams") or {}
+    home = dict(teams.get("home") or {})
+    away = dict(teams.get("away") or {})
+    if home.get("name"):
+        home["name"] = display_team_name(str(home["name"]))
+    if away.get("name"):
+        away["name"] = display_team_name(str(away["name"]))
+    normalized = dict(game)
+    normalized["teams"] = {"home": home, "away": away}
+    return normalized
+
+
 def khl_games_keyboard(games: list[dict]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    for index, game in enumerate(games[:15]):
+    for index, raw_game in enumerate(games[:15]):
+        game = normalize_game_names(raw_game)
         game_id = game.get("id")
         teams = game.get("teams") or {}
         home = (teams.get("home") or {}).get("name") or "Хозяева"
@@ -153,6 +169,11 @@ async def callbacks(callback: CallbackQuery) -> None:
                     text = "Матч не найден. Обнови список матчей КХЛ."
                     markup = back_khl_keyboard()
                 else:
+                    # Important: normalize names BEFORE requesting official KHL context.
+                    # The official KHL provider uses Russian club names, while API-Sports
+                    # may return English names or cities (e.g. Cherepovets/Khabarovsk).
+                    game = normalize_game_names(game)
+
                     await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n2/5 Получаю все доступные линии...")
                     markets = await khl.markets_for_game(game_id)
 
