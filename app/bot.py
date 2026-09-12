@@ -25,16 +25,44 @@ khl = EnhancedKHLService(ApiSportsClient(settings.api_sports_key)) if settings.a
 ai_predictor = Best3AIPredictor(settings.openai_api_key, settings.openai_model, settings.openai_base_url) if settings.openai_api_key else None
 
 
+def _team_obj(value: object) -> dict:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _team_name(obj: dict) -> str:
+    # API-Sports and HockeyTech use several different field names.
+    for key in ("name", "teamName", "shortName", "team_name", "title"):
+        value = obj.get(key)
+        if value:
+            return str(value).strip()
+    return ""
+
+
 def normalize_game_names(game: dict) -> dict:
-    """Normalize provider-specific KHL team names before UI and analytics."""
-    teams = game.get("teams") or {}
-    home = dict(teams.get("home") or {})
-    away = dict(teams.get("away") or {})
-    if home.get("name"):
-        home["name"] = display_team_name(str(home["name"]))
-    if away.get("name"):
-        away["name"] = display_team_name(str(away["name"]))
+    """Normalize provider-specific KHL team names before UI and analytics.
+
+    Never expose provider cities/English aliases such as Khabarovsk or
+    Cherepovets to Telegram when a known KHL club name is available.
+    """
     normalized = dict(game)
+    teams = dict(game.get("teams") or {})
+    home = _team_obj(teams.get("home"))
+    away = _team_obj(teams.get("away"))
+
+    # Fallback for provider payloads where teams are top-level objects.
+    if not _team_name(home):
+        home = _team_obj(game.get("homeTeam") or game.get("home_team") or game.get("home"))
+    if not _team_name(away):
+        away = _team_obj(game.get("awayTeam") or game.get("away_team") or game.get("away"))
+
+    home_name = display_team_name(_team_name(home))
+    away_name = display_team_name(_team_name(away))
+
+    if home_name:
+        home["name"] = home_name
+    if away_name:
+        away["name"] = away_name
+
     normalized["teams"] = {"home": home, "away": away}
     return normalized
 
@@ -45,8 +73,8 @@ def khl_games_keyboard(games: list[dict]) -> InlineKeyboardMarkup:
         game = normalize_game_names(raw_game)
         game_id = game.get("id")
         teams = game.get("teams") or {}
-        home = (teams.get("home") or {}).get("name") or "Хозяева"
-        away = (teams.get("away") or {}).get("name") or "Гости"
+        home = _team_name(_team_obj(teams.get("home"))) or "Хозяева"
+        away = _team_name(_team_obj(teams.get("away"))) or "Гости"
         if game_id is not None:
             rows.append([InlineKeyboardButton(text=f"{home} — {away}", callback_data=f"khl:game:{game_id}")])
         else:
@@ -139,6 +167,7 @@ async def callbacks(callback: CallbackQuery) -> None:
                     text = "🏒 <b>КХЛ</b>\n\nНа текущую дату матчи КХЛ не найдены или источники временно недоступны."
                     markup = main_menu()
                 else:
+                    games = [normalize_game_names(game) for game in games]
                     schedule_only = sum(1 for game in games if game.get("__schedule_only"))
                     suffix = f"\n⚠️ Без линии API-Sports: {schedule_only}" if schedule_only else ""
                     text = f"🏒 <b>КХЛ</b>\n\nМатчи на сегодня: {len(games)}{suffix}\n\nВыбери матч:"
@@ -169,9 +198,6 @@ async def callbacks(callback: CallbackQuery) -> None:
                     text = "Матч не найден. Обнови список матчей КХЛ."
                     markup = back_khl_keyboard()
                 else:
-                    # Important: normalize names BEFORE requesting official KHL context.
-                    # The official KHL provider uses Russian club names, while API-Sports
-                    # may return English names or cities (e.g. Cherepovets/Khabarovsk).
                     game = normalize_game_names(game)
 
                     await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n2/5 Получаю все доступные линии...")
