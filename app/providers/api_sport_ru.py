@@ -5,6 +5,8 @@ from typing import Any
 
 import httpx
 
+from ..models import Market
+
 
 class ApiSportRuError(RuntimeError):
     pass
@@ -73,17 +75,26 @@ class ApiSportRuClient:
         return cls._name(home), cls._name(away)
 
     @staticmethod
+    def _match_date(match: dict[str, Any]) -> str:
+        for key in ("dateEvent", "startTimestamp", "startTime", "date", "datetime"):
+            value = match.get(key)
+            if value in (None, ""):
+                continue
+            if isinstance(value, (int, float)):
+                try:
+                    return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
+                except (OverflowError, OSError, ValueError):
+                    pass
+            return str(value)
+        return ""
+
+    @staticmethod
     def _norm(value: str) -> str:
         value = value.lower().replace("ё", "е")
         replacements = {
-            "мск": "москва",
-            "moscow": "москва",
-            "dinamo": "динамо",
-            "dynamo": "динамо",
-            "минск": "минск",
-            "minsk": "минск",
-            "spartak": "спартак",
-            "severstal": "северсталь",
+            "мск": "москва", "moscow": "москва", "dinamo": "динамо",
+            "dynamo": "динамо", "spartak": "спартак", "severstal": "северсталь",
+            "barys": "барыс", "amur": "амур",
         }
         for src, dst in replacements.items():
             value = value.replace(src, dst)
@@ -99,8 +110,7 @@ class ApiSportRuClient:
         if a == b or a in b or b in a:
             return True
         at, bt = set(a.split()), set(b.split())
-        common = at & bt
-        return len(common) >= max(1, min(len(at), len(bt)) - 1)
+        return len(at & bt) >= max(1, min(len(at), len(bt)) - 1)
 
     @classmethod
     def _find_match(cls, matches: list[dict[str, Any]], home: str, away: str) -> dict[str, Any] | None:
@@ -109,6 +119,83 @@ class ApiSportRuClient:
             if cls._same_team(mh, home) and cls._same_team(ma, away):
                 return item
         return None
+
+    @classmethod
+    def _is_khl(cls, match: dict[str, Any]) -> bool:
+        tournament = match.get("tournament") or match.get("league") or {}
+        if isinstance(tournament, dict):
+            values = [tournament.get("name"), tournament.get("shortName"), tournament.get("slug")]
+        else:
+            values = [tournament]
+        text = cls._norm(" ".join(str(v or "") for v in values))
+        return "кхл" in text or "khl" in text or "kontinental" in text
+
+    @classmethod
+    def normalize_match(cls, match: dict[str, Any]) -> dict[str, Any]:
+        home, away = cls._teams(match)
+        tournament = match.get("tournament") or match.get("league") or {}
+        tournament_name = tournament.get("name") if isinstance(tournament, dict) else str(tournament or "КХЛ")
+        return {
+            "id": match.get("id"),
+            "date": cls._match_date(match),
+            "datetime": cls._match_date(match),
+            "teams": {"home": {"name": home}, "away": {"name": away}},
+            "league": {"name": str(tournament_name or "КХЛ"), "id": tournament.get("id") if isinstance(tournament, dict) else None},
+            "__api_sport_ru": True,
+            "__raw_api_sport_ru": match,
+        }
+
+    async def khl_matches(self, date: str | None = None) -> list[dict[str, Any]]:
+        payload = await self.get("ice-hockey/matches", date=date, limit=100)
+        matches = self._items(payload)
+        khl = [item for item in matches if self._is_khl(item)]
+        return khl or matches
+
+    async def match_by_id(self, match_id: int | str) -> dict[str, Any]:
+        payload = await self.get(f"ice-hockey/matches/{int(match_id)}")
+        return self._one(payload)
+
+    @staticmethod
+    def markets_from_match(match: dict[str, Any]) -> tuple[Market, ...]:
+        odds = match.get("oddsBase") or match.get("oddsBk") or []
+        if isinstance(odds, dict):
+            odds = odds.get("markets") or odds.get("items") or []
+        if not isinstance(odds, list):
+            return ()
+        markets: list[Market] = []
+        for market in odds:
+            if not isinstance(market, dict):
+                continue
+            market_name = str(market.get("name") or market.get("group") or "Рынок")
+            values = market.get("choices") or market.get("outcomes") or market.get("values") or []
+            if not isinstance(values, list):
+                continue
+            parsed: list[tuple[str, float]] = []
+            for choice in values:
+                if not isinstance(choice, dict):
+                    continue
+                name = str(choice.get("name") or choice.get("value") or choice.get("label") or "").strip()
+                raw_odd = choice.get("decimal") or choice.get("odds") or choice.get("price") or choice.get("odd")
+                try:
+                    odd = float(raw_odd)
+                except (TypeError, ValueError):
+                    continue
+                if name and odd > 1:
+                    parsed.append((name, odd))
+            if len(parsed) < 2:
+                continue
+            denominator = sum(1.0 / odd for _, odd in parsed)
+            if denominator <= 0:
+                continue
+            for name, odd in parsed:
+                probability = (1.0 / odd) / denominator
+                markets.append(Market(name=f"{market_name}: {name}", odds=odd, probability=probability))
+        best: dict[str, Market] = {}
+        for market in markets:
+            previous = best.get(market.name)
+            if previous is None or market.odds > previous.odds:
+                best[market.name] = market
+        return tuple(sorted(best.values(), key=lambda m: m.value_percent, reverse=True)[:50])
 
     @staticmethod
     def _compact(value: Any, depth: int = 0) -> Any:
@@ -131,23 +218,11 @@ class ApiSportRuClient:
     def _count_history(cls, value: Any) -> int:
         if isinstance(value, list):
             dicts = [x for x in value if isinstance(x, dict)]
-            if dicts and any(
-                any(
-                    k in x
-                    for k in (
-                        "dateEvent", "startTimestamp", "homeTeam", "awayTeam",
-                        "homeScore", "awayScore", "homeScoreDisplay", "awayScoreDisplay",
-                    )
-                )
-                for x in dicts
-            ):
+            if dicts and any(any(k in x for k in ("dateEvent", "startTimestamp", "homeTeam", "awayTeam", "homeScore", "awayScore", "homeScoreDisplay", "awayScoreDisplay")) for x in dicts):
                 return len(dicts)
             return max((cls._count_history(x) for x in value), default=0)
         if isinstance(value, dict):
-            for key in (
-                "matches", "games", "results", "history", "lastMatches",
-                "previousMatches", "items", "events", "form",
-            ):
+            for key in ("matches", "games", "results", "history", "lastMatches", "previousMatches", "items", "events", "form"):
                 if key in value:
                     count = cls._count_history(value[key])
                     if count:
@@ -157,91 +232,35 @@ class ApiSportRuClient:
 
     @classmethod
     def _quality(cls, pregame: Any) -> dict[str, int | bool]:
-        empty = {
-            "история_хозяев": 0,
-            "история_гостей": 0,
-            "h2h": 0,
-            "есть_таблица": False,
-            "есть_сезонная_статистика": False,
-        }
+        empty = {"история_хозяев": 0, "история_гостей": 0, "h2h": 0, "есть_таблица": False, "есть_сезонная_статистика": False}
         if not isinstance(pregame, dict):
             return empty
-
         form = pregame.get("form") or pregame.get("teamForm") or {}
         h2h = pregame.get("h2h") or pregame.get("headToHead") or {}
-
-        home_form = None
-        away_form = None
-        if isinstance(form, dict):
-            home_form = form.get("home") or form.get("homeTeam") or form.get("host")
-            away_form = form.get("away") or form.get("awayTeam") or form.get("guest")
-
+        home_form = form.get("home") or form.get("homeTeam") or form.get("host") if isinstance(form, dict) else None
+        away_form = form.get("away") or form.get("awayTeam") or form.get("guest") if isinstance(form, dict) else None
         home_count = cls._count_history(home_form) if home_form is not None else 0
         away_count = cls._count_history(away_form) if away_form is not None else 0
-
-        # Some API-SPORT.ru responses expose form as a pair/list of sides rather
-        # than form.home/form.away. Do not assign the same list to both teams;
-        # inspect explicit side labels when available.
-        if (home_count == 0 or away_count == 0) and isinstance(form, list):
-            for side in form:
-                if not isinstance(side, dict):
-                    continue
-                side_name = cls._norm(str(side.get("side") or side.get("team") or side.get("type") or ""))
-                count = cls._count_history(side)
-                if "home" in side_name or "хозя" in side_name:
-                    home_count = max(home_count, count)
-                elif "away" in side_name or "гост" in side_name:
-                    away_count = max(away_count, count)
-
         return {
             "история_хозяев": home_count,
             "история_гостей": away_count,
             "h2h": cls._count_history(h2h),
             "есть_таблица": bool(pregame.get("standings") or pregame.get("table")),
-            "есть_сезонная_статистика": bool(
-                form or pregame.get("teamStreaks") or pregame.get("seasonStats")
-            ),
+            "есть_сезонная_статистика": bool(form or pregame.get("teamStreaks") or pregame.get("seasonStats")),
         }
 
     async def find_khl_match(self, home: str, away: str, start_time: str = "") -> dict[str, Any] | None:
         date = start_time[:10] if len(start_time) >= 10 else datetime.now(timezone.utc).date().isoformat()
-
-        # The API docs use /v2/{sportSlug}/matches and the hockey sport slug is
-        # ice-hockey. Ask for pregame data in the list when available, then use
-        # the match-by-ID endpoint, which always includes the pregame block.
-        payload = await self.get(
-            "ice-hockey/matches",
-            date=date,
-            with_pregame="true",
-            limit=100,
-        )
+        payload = await self.get("ice-hockey/matches", date=date, with_pregame="true", limit=100)
         matches = self._items(payload)
-
-        candidates = []
-        for item in matches:
-            tournament = item.get("tournament") or item.get("league") or {}
-            tournament_name = tournament.get("name") if isinstance(tournament, dict) else str(tournament)
-            normalized_tournament = self._norm(str(tournament_name or ""))
-            if "кхл" in normalized_tournament or "khl" in normalized_tournament or "kontinental" in normalized_tournament:
-                candidates.append(item)
-
+        candidates = [item for item in matches if self._is_khl(item)]
         found = self._find_match(candidates, home, away) or self._find_match(matches, home, away)
         if found:
             return found
-
-        # Search mode is useful when the provider's date filter uses a different
-        # timezone around midnight or the daily feed is paginated. The docs
-        # explicitly support q= for team/tournament name search.
         for query in (f"{home} {away}", home, away):
             try:
-                search_payload = await self.get(
-                    "ice-hockey/matches",
-                    q=query,
-                    limit=50,
-                    with_pregame="true",
-                )
-                search_matches = self._items(search_payload)
-                found = self._find_match(search_matches, home, away)
+                search_payload = await self.get("ice-hockey/matches", q=query, limit=50, with_pregame="true")
+                found = self._find_match(self._items(search_payload), home, away)
                 if found:
                     return found
             except Exception:
@@ -251,39 +270,22 @@ class ApiSportRuClient:
     async def build_context(self, home: str, away: str, start_time: str = "") -> dict[str, Any]:
         match = await self.find_khl_match(home, away, start_time)
         if not match:
-            return {
-                "источник_статистики": "API-SPORT.ru",
-                "матч_найден": False,
-                "качество_данных": {
-                    "история_хозяев": 0,
-                    "история_гостей": 0,
-                    "h2h": 0,
-                    "есть_таблица": False,
-                    "есть_сезонная_статистика": False,
-                },
-            }
-
+            return {"источник_статистики": "API-SPORT.ru", "матч_найден": False, "качество_данных": {"история_хозяев": 0, "история_гостей": 0, "h2h": 0, "есть_таблица": False, "есть_сезонная_статистика": False}}
         match_id = match.get("id")
         detail = match
         if match_id is not None:
             try:
-                detail_payload = await self.get(f"ice-hockey/matches/{int(match_id)}")
-                detail = self._one(detail_payload)
+                detail = await self.match_by_id(match_id)
             except Exception:
                 detail = match
-
         pregame = detail.get("pregame") or match.get("pregame") or {}
-        quality = self._quality(pregame)
         return {
             "источник_статистики": "API-SPORT.ru",
             "матч_найден": True,
             "match_id": match_id,
             "турнир": self._compact(detail.get("tournament") or match.get("tournament")),
             "сезон": self._compact(detail.get("season") or match.get("season")),
-            "команды": {
-                "хозяева": self._teams(detail)[0],
-                "гости": self._teams(detail)[1],
-            },
+            "команды": {"хозяева": self._teams(detail)[0], "гости": self._teams(detail)[1]},
             "статус": detail.get("status"),
             "счёт": self._compact(detail.get("homeScore")),
             "счёт_гостей": self._compact(detail.get("awayScore")),
@@ -291,5 +293,5 @@ class ApiSportRuClient:
             "статистика_матча": self._compact(detail.get("matchStatistics")),
             "коэффициенты": self._compact(detail.get("oddsBase")),
             "букмекерские_коэффициенты": self._compact(detail.get("oddsBk")),
-            "качество_данных": quality,
+            "качество_данных": self._quality(pregame),
         }
