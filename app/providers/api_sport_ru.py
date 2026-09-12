@@ -40,7 +40,7 @@ class ApiSportRuClient:
             if isinstance(value, list):
                 return [item for item in value if isinstance(item, dict)]
             if isinstance(value, dict):
-                for nested_key in ("matches", "data", "items", "results"):
+                for nested_key in ("matches", "data", "items", "results", "response"):
                     nested = value.get(nested_key)
                     if isinstance(nested, list):
                         return [item for item in nested if isinstance(item, dict)]
@@ -82,6 +82,8 @@ class ApiSportRuClient:
             "dynamo": "динамо",
             "минск": "минск",
             "minsk": "минск",
+            "spartak": "спартак",
+            "severstal": "северсталь",
         }
         for src, dst in replacements.items():
             value = value.replace(src, dst)
@@ -130,13 +132,22 @@ class ApiSportRuClient:
         if isinstance(value, list):
             dicts = [x for x in value if isinstance(x, dict)]
             if dicts and any(
-                any(k in x for k in ("dateEvent", "startTimestamp", "homeTeam", "awayTeam", "homeScore", "awayScore"))
+                any(
+                    k in x
+                    for k in (
+                        "dateEvent", "startTimestamp", "homeTeam", "awayTeam",
+                        "homeScore", "awayScore", "homeScoreDisplay", "awayScoreDisplay",
+                    )
+                )
                 for x in dicts
             ):
                 return len(dicts)
             return max((cls._count_history(x) for x in value), default=0)
         if isinstance(value, dict):
-            for key in ("form", "home", "away", "matches", "games", "results", "history", "lastMatches", "previousMatches"):
+            for key in (
+                "matches", "games", "results", "history", "lastMatches",
+                "previousMatches", "items", "events", "form",
+            ):
                 if key in value:
                     count = cls._count_history(value[key])
                     if count:
@@ -146,33 +157,66 @@ class ApiSportRuClient:
 
     @classmethod
     def _quality(cls, pregame: Any) -> dict[str, int | bool]:
+        empty = {
+            "история_хозяев": 0,
+            "история_гостей": 0,
+            "h2h": 0,
+            "есть_таблица": False,
+            "есть_сезонная_статистика": False,
+        }
         if not isinstance(pregame, dict):
-            return {"история_хозяев": 0, "история_гостей": 0, "h2h": 0, "есть_таблица": False, "есть_сезонная_статистика": False}
+            return empty
+
         form = pregame.get("form") or pregame.get("teamForm") or {}
         h2h = pregame.get("h2h") or pregame.get("headToHead") or {}
-        home_form = form.get("home") if isinstance(form, dict) else None
-        away_form = form.get("away") if isinstance(form, dict) else None
+
+        home_form = None
+        away_form = None
+        if isinstance(form, dict):
+            home_form = form.get("home") or form.get("homeTeam") or form.get("host")
+            away_form = form.get("away") or form.get("awayTeam") or form.get("guest")
+
+        home_count = cls._count_history(home_form) if home_form is not None else 0
+        away_count = cls._count_history(away_form) if away_form is not None else 0
+
+        # Some API-SPORT.ru responses expose form as a pair/list of sides rather
+        # than form.home/form.away. Do not assign the same list to both teams;
+        # inspect explicit side labels when available.
+        if (home_count == 0 or away_count == 0) and isinstance(form, list):
+            for side in form:
+                if not isinstance(side, dict):
+                    continue
+                side_name = cls._norm(str(side.get("side") or side.get("team") or side.get("type") or ""))
+                count = cls._count_history(side)
+                if "home" in side_name or "хозя" in side_name:
+                    home_count = max(home_count, count)
+                elif "away" in side_name or "гост" in side_name:
+                    away_count = max(away_count, count)
+
         return {
-            "история_хозяев": cls._count_history(home_form if home_form is not None else form),
-            "история_гостей": cls._count_history(away_form if away_form is not None else form),
+            "история_хозяев": home_count,
+            "история_гостей": away_count,
             "h2h": cls._count_history(h2h),
             "есть_таблица": bool(pregame.get("standings") or pregame.get("table")),
-            "есть_сезонная_статистика": bool(form or pregame.get("teamStreaks") or pregame.get("seasonStats")),
+            "есть_сезонная_статистика": bool(
+                form or pregame.get("teamStreaks") or pregame.get("seasonStats")
+            ),
         }
 
     async def find_khl_match(self, home: str, away: str, start_time: str = "") -> dict[str, Any] | None:
         date = start_time[:10] if len(start_time) >= 10 else datetime.now(timezone.utc).date().isoformat()
 
-        # API-SPORT.ru documents date as a filter for /matches. Do not send
-        # undocumented parameters here: an invalid optional parameter can make
-        # the entire request fail and silently remove this provider from the
-        # source ranking.
-        payload = await self.get("ice-hockey/matches", date=date)
+        # The API docs use /v2/{sportSlug}/matches and the hockey sport slug is
+        # ice-hockey. Ask for pregame data in the list when available, then use
+        # the match-by-ID endpoint, which always includes the pregame block.
+        payload = await self.get(
+            "ice-hockey/matches",
+            date=date,
+            with_pregame="true",
+            limit=100,
+        )
         matches = self._items(payload)
 
-        # First try KHL-labelled tournaments, then the full daily feed. Team
-        # matching is deliberately independent of the tournament name because
-        # providers may return localized names such as KHL / КХЛ / Kontinental.
         candidates = []
         for item in matches:
             tournament = item.get("tournament") or item.get("league") or {}
@@ -181,7 +225,28 @@ class ApiSportRuClient:
             if "кхл" in normalized_tournament or "khl" in normalized_tournament or "kontinental" in normalized_tournament:
                 candidates.append(item)
 
-        return self._find_match(candidates, home, away) or self._find_match(matches, home, away)
+        found = self._find_match(candidates, home, away) or self._find_match(matches, home, away)
+        if found:
+            return found
+
+        # Search mode is useful when the provider's date filter uses a different
+        # timezone around midnight or the daily feed is paginated. The docs
+        # explicitly support q= for team/tournament name search.
+        for query in (f"{home} {away}", home, away):
+            try:
+                search_payload = await self.get(
+                    "ice-hockey/matches",
+                    q=query,
+                    limit=50,
+                    with_pregame="true",
+                )
+                search_matches = self._items(search_payload)
+                found = self._find_match(search_matches, home, away)
+                if found:
+                    return found
+            except Exception:
+                continue
+        return None
 
     async def build_context(self, home: str, away: str, start_time: str = "") -> dict[str, Any]:
         match = await self.find_khl_match(home, away, start_time)
@@ -189,7 +254,13 @@ class ApiSportRuClient:
             return {
                 "источник_статистики": "API-SPORT.ru",
                 "матч_найден": False,
-                "качество_данных": {"история_хозяев": 0, "история_гостей": 0, "h2h": 0, "есть_таблица": False, "есть_сезонная_статистика": False},
+                "качество_данных": {
+                    "история_хозяев": 0,
+                    "история_гостей": 0,
+                    "h2h": 0,
+                    "есть_таблица": False,
+                    "есть_сезонная_статистика": False,
+                },
             }
 
         match_id = match.get("id")
