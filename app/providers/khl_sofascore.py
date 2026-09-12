@@ -45,6 +45,14 @@ class KHLScoreClient:
             "nizhny novgorod": ["torpedo", "торпедо", "torpedo nizhny novgorod"],
             "niznekamsk": ["neftekhimik", "нефтехимик", "neftekhimik nizhnekamsk"],
             "yekaterinburg": ["avtomobilist", "автомобилист", "avtomobilist yekaterinburg"],
+            "sochi": ["sochi", "hk sochi", "сочи", "хк сочи"],
+            "ska st petersburg": ["ska", "ska st petersburg", "ska saint petersburg", "ска", "ска санкт петербург", "ска спб"],
+            "spartak moscow": ["spartak", "spartak moscow", "спартак", "спартак москва"],
+            "cherepovets": ["severstal", "severstal cherepovets", "северсталь", "северсталь череповец"],
+            "omsk": ["avangard", "avangard omsk", "авангард", "авангард омск"],
+            "novosibirsk": ["sibir", "sibir novosibirsk", "сибирь", "сибирь новосибирск"],
+            "ufa": ["salavat yulaev", "salavat yulaev ufa", "салават юлаев", "салават юлаев уфа"],
+            "yaroslavl": ["lokomotiv", "lokomotiv yaroslavl", "локомотив", "локомотив ярославль"],
         }
         candidates = aliases.get(a, [a])
         return b == a or a in b or b in a or any(c == b or c in b for c in candidates)
