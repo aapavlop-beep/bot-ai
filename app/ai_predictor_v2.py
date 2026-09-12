@@ -36,9 +36,10 @@ class Best3AIPredictor(AIPredictor):
                     "Твоя задача — дать три лучших прогноза по силе спортивного сценария, а не просто три самых вероятных исхода. "
                     "ОБЯЗАТЕЛЬНО сначала изучи блок спортивный_контекст. "
                     "Если активный_источник_статистики не равен 'нет', статистика реально получена и должна использоваться. "
+                    "Если активный_источник_статистики равен 'API-SPORT.ru', API-SPORT.ru является ПРИОРИТЕТНЫМ источником: используй его данные как основу прогноза и не заменяй их данными HockeyTech, SofaScore или другого источника. "
                     "Опирайся на конкретные цифры: последние матчи, победы/поражения, забитые и пропущенные, средние голы, H2H, таблицу, домашний/гостевой фактор. "
+                    "В первую очередь изучи поле статистика_для_ии — оно содержит выбранный основной источник. "
                     "Не пиши 'статистика отсутствует', если в контексте есть эти поля. "
-                    "Если есть несколько источников, используй источник с наибольшим качеством данных. "
                     "Рыночные вероятности и коэффициенты — только дополнительная информация; не копируй рыночную вероятность без спортивного обоснования. "
                     "Для каждой выбранной линии самостоятельно оцени вероятность. "
                     "Не выдумывай составы, травмы, форму или цифры, которых нет в контексте. "
@@ -126,19 +127,20 @@ class Best3AIPredictor(AIPredictor):
             "гости": match.away,
             "начало": match.start_time,
             "качество_данных_0_10": quality,
+            "главный_источник_статистики": match.analysis_data.get("главный_источник_статистики", "API-SPORT.ru"),
             "активный_источник_статистики": match.analysis_data.get("активный_источник_статистики", "нет"),
+            "режим_источника": match.analysis_data.get("режим_источника", ""),
             "диагностика_статистики": match.analysis_data.get("диагностика_статистики", ""),
+            "статистика_для_ии": match.analysis_data.get("статистика_для_ии", {}),
             "спортивный_контекст": match.analysis_data,
             "доступные_линии": markets,
-            "задача": "Используй реальные спортивные данные и выбери ровно три лучших сценария в порядке силы. №1 — лучший, №2 и №3 — следующие по качеству.",
+            "задача": "Используй реальные спортивные данные, прежде всего статистику_для_ии из API-SPORT.ru, и выбери ровно три лучших сценария в порядке силы. №1 — лучший, №2 и №3 — следующие по качеству.",
         }
         data = self._request_v2(payload)
         raw_recs = data.get("recommendations") or []
         by_name = {m.name: m for m in match.markets}
         result: list[Recommendation] = []
 
-        # Preserve the order returned by the analytical model: it is explicitly
-        # asked to rank 1..3. Do not reorder by raw market value afterward.
         for raw in raw_recs:
             if not isinstance(raw, dict):
                 continue
@@ -173,8 +175,6 @@ class Best3AIPredictor(AIPredictor):
             if len(result) >= 3:
                 break
 
-        # Only fill missing slots; never replace a model-ranked recommendation
-        # with a higher-margin market just because its coefficient is larger.
         used = {r.pick for r in result}
         remaining = [m for m in match.markets if m.name not in used]
         remaining.sort(key=lambda m: (m.probability, m.value_percent), reverse=True)
