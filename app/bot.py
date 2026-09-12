@@ -11,6 +11,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from .ai_predictor_v2 import Best3AIPredictor
 from .config import settings
+from .khl_auto_refresh import KHLBackgroundCache
 from .khl_enhanced import EnhancedKHLService
 from .khl_schedule import verified_today_games
 from .keyboards import main_menu
@@ -23,6 +24,7 @@ dp = Dispatcher()
 store = PredictionStore(settings.database_path)
 khl = EnhancedKHLService(ApiSportsClient(settings.api_sports_key)) if settings.api_sports_key else None
 ai_predictor = Best3AIPredictor(settings.openai_api_key, settings.openai_model, settings.openai_base_url) if settings.openai_api_key else None
+khl_refresh = KHLBackgroundCache(khl, interval_minutes=60) if khl is not None else None
 
 
 def _team_obj(value: object) -> dict:
@@ -30,7 +32,6 @@ def _team_obj(value: object) -> dict:
 
 
 def _team_name(obj: dict) -> str:
-    # API-Sports and HockeyTech use several different field names.
     for key in ("name", "teamName", "shortName", "team_name", "title"):
         value = obj.get(key)
         if value:
@@ -39,30 +40,20 @@ def _team_name(obj: dict) -> str:
 
 
 def normalize_game_names(game: dict) -> dict:
-    """Normalize provider-specific KHL team names before UI and analytics.
-
-    Never expose provider cities/English aliases such as Khabarovsk or
-    Cherepovets to Telegram when a known KHL club name is available.
-    """
     normalized = dict(game)
     teams = dict(game.get("teams") or {})
     home = _team_obj(teams.get("home"))
     away = _team_obj(teams.get("away"))
-
-    # Fallback for provider payloads where teams are top-level objects.
     if not _team_name(home):
         home = _team_obj(game.get("homeTeam") or game.get("home_team") or game.get("home"))
     if not _team_name(away):
         away = _team_obj(game.get("awayTeam") or game.get("away_team") or game.get("away"))
-
     home_name = display_team_name(_team_name(home))
     away_name = display_team_name(_team_name(away))
-
     if home_name:
         home["name"] = home_name
     if away_name:
         away["name"] = away_name
-
     normalized["teams"] = {"home": home, "away": away}
     return normalized
 
@@ -122,14 +113,11 @@ async def start(message: Message) -> None:
 @dp.callback_query()
 async def callbacks(callback: CallbackQuery) -> None:
     data = callback.data or ""
-
     try:
         await callback.answer()
-
         if data == "menu":
             text = "🎯 <b>Спортивная аналитика</b>\n\n🏒 КХЛ • ⚽ Футбол • 🎮 CS2\n\nВыбери раздел:"
             markup = main_menu()
-
         elif data == "stats":
             stats = store.stats()
             text = (
@@ -140,7 +128,6 @@ async def callbacks(callback: CallbackQuery) -> None:
                 f"Проходимость: {stats['hit_rate']:.1f}%"
             )
             markup = main_menu()
-
         elif data == "about":
             text = (
                 "ℹ️ <b>О боте</b>\n\n"
@@ -149,20 +136,18 @@ async def callbacks(callback: CallbackQuery) -> None:
                 "Сейчас запускаем первый полноценный раздел — КХЛ."
             )
             markup = main_menu()
-
         elif data == "top":
             text = (
                 "🔥 <b>Лучшие прогнозы</b>\n\n"
                 "После обновления аналитики здесь будут отображаться лучшие кандидаты по всем матчам."
             )
             markup = main_menu()
-
         elif data == "sport:khl":
             if khl is None:
                 text = "🏒 <b>КХЛ</b>\n\nНе указан API_SPORTS_KEY в локальном .env."
                 markup = main_menu()
             else:
-                games = await verified_today_games(khl.client)
+                games = khl_refresh.get_games() if khl_refresh and khl_refresh.get_games() else await verified_today_games(khl.client)
                 if not games:
                     text = "🏒 <b>КХЛ</b>\n\nНа текущую дату матчи КХЛ не найдены или источники временно недоступны."
                     markup = main_menu()
@@ -170,9 +155,8 @@ async def callbacks(callback: CallbackQuery) -> None:
                     games = [normalize_game_names(game) for game in games]
                     schedule_only = sum(1 for game in games if game.get("__schedule_only"))
                     suffix = f"\n⚠️ Без линии API-Sports: {schedule_only}" if schedule_only else ""
-                    text = f"🏒 <b>КХЛ</b>\n\nМатчи на сегодня: {len(games)}{suffix}\n\nВыбери матч:"
+                    text = f"🏒 <b>КХЛ</b>\n\nМатчи на сегодня: {len(games)}{suffix}\n\nВыбери матч:\n\n🔄 Данные обновляются автоматически каждый час."
                     markup = khl_games_keyboard(games)
-
         elif data.startswith("khl:missing:"):
             text = (
                 "⚠️ <b>Матч найден в официальном расписании КХЛ</b>\n\n"
@@ -180,7 +164,6 @@ async def callbacks(callback: CallbackQuery) -> None:
                 "Матч не удаляем из расписания — ждём, пока источник синхронизирует событие."
             )
             markup = back_khl_keyboard()
-
         elif data.startswith("khl:game:"):
             if khl is None:
                 text = "Не указан API_SPORTS_KEY в локальном .env."
@@ -191,59 +174,51 @@ async def callbacks(callback: CallbackQuery) -> None:
             else:
                 game_id = int(data.rsplit(":", 1)[1])
                 await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n1/5 Получаю данные матча и линию...")
-
-                games = await verified_today_games(khl.client)
-                game = next((item for item in games if int(item.get("id", -1)) == game_id), None)
-                if game is None:
-                    text = "Матч не найден. Обнови список матчей КХЛ."
-                    markup = back_khl_keyboard()
+                cached = khl_refresh.get_context(game_id) if khl_refresh else None
+                if cached:
+                    game, markets, analysis_data = cached
                 else:
+                    games = await verified_today_games(khl.client)
+                    game = next((item for item in games if int(item.get("id", -1)) == game_id), None)
+                    if game is None:
+                        await safe_edit(callback, "Матч не найден. Обнови список матчей КХЛ.", back_khl_keyboard())
+                        return
                     game = normalize_game_names(game)
-
                     await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n2/5 Получаю все доступные линии...")
                     markets = await khl.markets_for_game(game_id)
-
                     await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n3/5 Получаю официальную статистику КХЛ, форму и очные встречи...")
                     analysis_data = await khl.analysis_for_game(game)
-                    match = khl.to_match(game, markets, analysis_data)
-
-                    await safe_status(
-                        callback,
-                        f"🏒 <b>{match.home} — {match.away}</b>\n\n"
-                        f"4/5 Линий получено: <b>{len(match.markets)}</b>\n"
-                        "🤖 ИИ выбирает лучший прогноз и две сильные альтернативы...",
-                    )
-
-                    try:
-                        predictions = await asyncio.wait_for(
-                            asyncio.to_thread(ai_predictor.predict, match),
-                            timeout=90.0,
-                        )
-                        diagnostic = analysis_data.get("диагностика_статистики", "")
-                        source = analysis_data.get("активный_источник_статистики", "нет")
-                        text = khl.format_game(match) + Best3AIPredictor.format(predictions)
-                        text += f"\n\n📡 <b>Статистика:</b> {source}"
-                        if diagnostic:
-                            text += f"\n🔎 {diagnostic}"
-                    except asyncio.TimeoutError:
-                        print("AI prediction error: TimeoutError: AI did not answer within 90 seconds")
-                        text = khl.format_game(match) + "\n\n⚠️ <b>ИИ не успел ответить.</b>\nПопробуй запрос ещё раз."
-                    except Exception as exc:
-                        print(f"AI prediction error: {type(exc).__name__}: {exc}")
-                        text = khl.format_game(match) + "\n\n⚠️ <b>ИИ-прогноз временно недоступен.</b>\nОшибка: " + type(exc).__name__
-                    markup = back_khl_keyboard()
-
+                game = normalize_game_names(game)
+                match = khl.to_match(game, markets, analysis_data)
+                await safe_status(
+                    callback,
+                    f"🏒 <b>{match.home} — {match.away}</b>\n\n"
+                    f"4/5 Линий получено: <b>{len(match.markets)}</b>\n"
+                    "🤖 ИИ выбирает лучший прогноз и две сильные альтернативы...",
+                )
+                try:
+                    predictions = await asyncio.wait_for(asyncio.to_thread(ai_predictor.predict, match), timeout=90.0)
+                    diagnostic = analysis_data.get("диагностика_статистики", "")
+                    source = analysis_data.get("активный_источник_статистики", "нет")
+                    text = khl.format_game(match) + Best3AIPredictor.format(predictions)
+                    text += f"\n\n📡 <b>Статистика:</b> {source}"
+                    if diagnostic:
+                        text += f"\n🔎 {diagnostic}"
+                except asyncio.TimeoutError:
+                    print("AI prediction error: TimeoutError: AI did not answer within 90 seconds")
+                    text = khl.format_game(match) + "\n\n⚠️ <b>ИИ не успел ответить.</b>\nПопробуй запрос ещё раз."
+                except Exception as exc:
+                    print(f"AI prediction error: {type(exc).__name__}: {exc}")
+                    text = khl.format_game(match) + "\n\n⚠️ <b>ИИ-прогноз временно недоступен.</b>\nОшибка: " + type(exc).__name__
+                markup = back_khl_keyboard()
         elif data.startswith("sport:"):
             sport = data.split(":", 1)[1].upper()
             text = f"{sport}\n\nЭтот раздел подключим следующим этапом."
             markup = main_menu()
-
         else:
             text = "Раздел пока не настроен."
             markup = main_menu()
-
         await safe_edit(callback, text, markup)
-
     except (ApiSportsError, ValueError) as exc:
         print(f"Application error: {type(exc).__name__}: {exc}")
         await safe_edit(callback, "⚠️ <b>Не удалось получить данные КХЛ.</b>\n\nПроверьте настройки API или попробуйте позже.", main_menu())
@@ -251,7 +226,6 @@ async def callbacks(callback: CallbackQuery) -> None:
             await callback.answer("Не удалось получить данные", show_alert=False)
         except TelegramBadRequest:
             pass
-
     except Exception as exc:
         print(f"Unhandled application error: {type(exc).__name__}: {exc}")
         await safe_edit(callback, "⚠️ <b>Произошла ошибка.</b>\n\nПроверь CMD — там будет точная причина.", main_menu())
@@ -259,4 +233,11 @@ async def callbacks(callback: CallbackQuery) -> None:
 
 async def run_bot() -> None:
     bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    await dp.start_polling(bot)
+    if khl_refresh is not None:
+        khl_refresh.start()
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if khl_refresh is not None:
+            await khl_refresh.stop()
+        await bot.session.close()
