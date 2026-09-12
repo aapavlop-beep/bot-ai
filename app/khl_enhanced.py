@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .khl import KHLService
+from .providers.api_sport_ru import ApiSportRuClient
 from .providers.khl_mobile import KHLMobileClient
 from .providers.khl_sofascore import KHLScoreClient
 
@@ -14,6 +15,7 @@ class EnhancedKHLService(KHLService):
         super().__init__(client)
         self.khl_mobile = KHLMobileClient()
         self.sofascore = KHLScoreClient()
+        self.api_sport_ru = ApiSportRuClient(__import__("app.config", fromlist=["settings"]).settings.api_sport_ru_key) if __import__("app.config", fromlist=["settings"]).settings.api_sport_ru_key else None
 
     @staticmethod
     def _quality(data: dict[str, Any]) -> dict[str, int | bool]:
@@ -63,11 +65,25 @@ class EnhancedKHLService(KHLService):
         home, away = self._teams(game)
         start = self._start_time(game)
         context: dict[str, Any] = {
-            "источники": ["Официальный KHL mobile API", "SofaScore", "API-Sports", "KHL HockeyTech"],
+            "источники": [
+                "API-SPORT.ru",
+                "Официальный KHL mobile API",
+                "SofaScore",
+                "API-Sports",
+                "KHL HockeyTech",
+            ],
             "сезон": self._season(game),
         }
 
-        # Collect every source independently. One provider returning an empty
+        # API-SPORT.ru: current match + pregame form/H2H/streaks + match stats/odds.
+        # It is optional; if unavailable, all existing sources continue to work.
+        if self.api_sport_ru is not None:
+            try:
+                context["данные_api_sport_ru"] = await self.api_sport_ru.build_context(home, away, start)
+            except Exception as exc:
+                context["ошибка_api_sport_ru"] = f"{type(exc).__name__}: {exc}"
+
+        # Collect every existing source independently. One provider returning an empty
         # result must not hide useful data from another provider.
         try:
             official = await self.khl_mobile.build_match_context(home, away, start)
@@ -109,6 +125,20 @@ class EnhancedKHLService(KHLService):
             context["ошибка_hockeytech"] = f"{type(exc).__name__}: {exc}"
 
         candidates: list[tuple[str, dict[str, Any], int]] = []
+
+        api_sport_ru = context.get("данные_api_sport_ru")
+        if isinstance(api_sport_ru, dict) and api_sport_ru.get("матч_найден"):
+            q = self._quality(api_sport_ru)
+            # Give API-SPORT.ru a meaningful score when it supplies pregame
+            # form/H2H, while still allowing a richer existing source to win.
+            score = (
+                int(q["история_хозяев"])
+                + int(q["история_гостей"])
+                + min(int(q["h2h"]), 10)
+                + (2 if q["есть_сезонная_статистика"] else 0)
+            )
+            candidates.append(("API-SPORT.ru", api_sport_ru, score))
+
         for key in ("официальные_данные_khl", "резервные_данные_khl"):
             data = context.get(key)
             if isinstance(data, dict):
