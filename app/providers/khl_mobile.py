@@ -65,10 +65,7 @@ class KHLMobileClient:
         end: datetime | None = None,
         page: int = 1,
     ) -> list[dict[str, Any]]:
-        params: dict[str, Any] = {
-            "order_direction": "asc",
-            "page": page,
-        }
+        params: dict[str, Any] = {"order_direction": "asc", "page": page}
         if stage_id is not None:
             params["stage_id"] = stage_id
         if team_id is not None:
@@ -88,6 +85,26 @@ class KHLMobileClient:
             elif isinstance(item, dict):
                 result.append(item)
         return result
+
+    async def events_with_stage_fallback(
+        self,
+        *,
+        stage_id: int | None,
+        team_id: int | None,
+        start: datetime,
+        end: datetime,
+    ) -> list[dict[str, Any]]:
+        """Query the current stage first, then retry without stage filtering.
+
+        The mobile API can keep an outdated current_stage_id while its events
+        endpoint already contains the new season. In that case stage filtering
+        silently returns an empty history.
+        """
+        games = await self.events(stage_id=stage_id, team_id=team_id, start=start, end=end)
+        if len(games) >= 3 or stage_id is None:
+            return games
+        fallback = await self.events(stage_id=None, team_id=team_id, start=start, end=end)
+        return fallback if len(fallback) > len(games) else games
 
     async def event(self, event_id: int) -> dict[str, Any]:
         payload = await self._get("event_v2.json", {"id": event_id}, ttl=30)
@@ -122,6 +139,14 @@ class KHLMobileClient:
             "yekaterinburg": ["автомобилист", "автомобилист екатеринбург"],
             "cska moscow": ["цска", "цска москва"],
             "vladivostok": ["адмирал", "адмирал владивосток"],
+            "dynamo moscow": ["динамо москва", "динамо м", "dynamo moscow", "dinamo moscow"],
+            "dinamo moscow": ["динамо москва", "динамо м", "dynamo moscow", "dinamo moscow"],
+            "dynamo minsk": ["динамо минск", "dynamo minsk", "dinamo minsk"],
+            "sochi": ["сочи", "хк сочи", "sochi"],
+            "ska st petersburg": ["ска", "ска санкт петербург", "ska", "ska st petersburg"],
+            "spartak moscow": ["спартак", "спартак москва", "spartak", "spartak moscow"],
+            "cherepovets": ["северсталь", "северсталь череповец", "severstal", "severstal cherepovets"],
+            "khabarovsk": ["амур", "амур хабаровск", "amur", "amur khabarovsk"],
         }
         candidates = [needle] + aliases.get(needle, [])
         for team in teams:
@@ -193,7 +218,7 @@ class KHLMobileClient:
                 return {"команда": team_name, "ошибка": "Команда не найдена в официальном справочнике КХЛ"}
             team_payload, games = await asyncio.gather(
                 self.team(team_id, stage_id),
-                self.events(stage_id=stage_id, team_id=team_id, start=history_start, end=history_end),
+                self.events_with_stage_fallback(stage_id=stage_id, team_id=team_id, start=history_start, end=history_end),
             )
             finished = [g for g in games if g.get("game_state_key") == "finished"]
             finished.sort(key=lambda x: x.get("start_at", 0), reverse=True)
@@ -250,7 +275,12 @@ class KHLMobileClient:
 
         h2h: list[dict[str, Any]] = []
         if home_id is not None and away_id is not None:
-            games_a = await self.events(stage_id=stage_id, team_id=home_id, start=start_dt - timedelta(days=730), end=start_dt)
+            games_a = await self.events_with_stage_fallback(
+                stage_id=stage_id,
+                team_id=home_id,
+                start=start_dt - timedelta(days=730),
+                end=start_dt,
+            )
             for game in games_a:
                 a = game.get("team_a") or {}
                 b = game.get("team_b") or {}
@@ -268,6 +298,13 @@ class KHLMobileClient:
                 start=start_dt - timedelta(hours=12),
                 end=start_dt + timedelta(hours=12),
             )
+            if len(upcoming) < 1 and stage_id is not None:
+                upcoming = await self.events(
+                    stage_id=None,
+                    team_id=home_id,
+                    start=start_dt - timedelta(hours=12),
+                    end=start_dt + timedelta(hours=12),
+                )
             for event in upcoming:
                 a = event.get("team_a") or {}
                 b = event.get("team_b") or {}
