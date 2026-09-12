@@ -172,20 +172,18 @@ async def callbacks(callback: CallbackQuery) -> None:
                             asyncio.to_thread(ai_predictor.predict, match),
                             timeout=90.0,
                         )
+                        diagnostic = analysis_data.get("диагностика_статистики", "")
+                        source = analysis_data.get("активный_источник_статистики", "нет")
                         text = khl.format_game(match) + Best3AIPredictor.format(predictions)
+                        text += f"\n\n📡 <b>Статистика:</b> {source}"
+                        if diagnostic:
+                            text += f"\n🔎 {diagnostic}"
                     except asyncio.TimeoutError:
                         print("AI prediction error: TimeoutError: AI did not answer within 90 seconds")
-                        text = (
-                            khl.format_game(match)
-                            + "\n\n⚠️ <b>ИИ не успел ответить.</b>\nПопробуй запрос ещё раз."
-                        )
+                        text = khl.format_game(match) + "\n\n⚠️ <b>ИИ не успел ответить.</b>\nПопробуй запрос ещё раз."
                     except Exception as exc:
                         print(f"AI prediction error: {type(exc).__name__}: {exc}")
-                        text = (
-                            khl.format_game(match)
-                            + "\n\n⚠️ <b>ИИ-прогноз временно недоступен.</b>\n"
-                            f"Ошибка: {type(exc).__name__}"
-                        )
+                        text = khl.format_game(match) + "\n\n⚠️ <b>ИИ-прогноз временно недоступен.</b>\nОшибка: " + type(exc).__name__
                     markup = back_khl_keyboard()
 
         elif data.startswith("sport:"):
@@ -201,8 +199,7 @@ async def callbacks(callback: CallbackQuery) -> None:
 
     except (ApiSportsError, ValueError) as exc:
         print(f"Application error: {type(exc).__name__}: {exc}")
-        error_text = "⚠️ <b>Не удалось получить данные КХЛ.</b>\n\nПроверьте настройки API или попробуйте позже."
-        await safe_edit(callback, error_text, main_menu())
+        await safe_edit(callback, "⚠️ <b>Не удалось получить данные КХЛ.</b>\n\nПроверьте настройки API или попробуйте позже.", main_menu())
         try:
             await callback.answer("Не удалось получить данные", show_alert=False)
         except TelegramBadRequest:
@@ -214,8 +211,5 @@ async def callbacks(callback: CallbackQuery) -> None:
 
 
 async def run_bot() -> None:
-    bot = Bot(
-        token=settings.bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
+    bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await dp.start_polling(bot)
