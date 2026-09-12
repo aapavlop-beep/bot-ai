@@ -23,40 +23,90 @@ class Recommendation:
     reason: str
 
 
+def _json_safe(value, seen=None, depth: int = 0):
+    """Return a JSON-safe copy and replace recursive references with None."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if depth > 8:
+        return None
+    if seen is None:
+        seen = set()
+    object_id = id(value)
+    if object_id in seen:
+        return None
+    if isinstance(value, dict):
+        seen.add(object_id)
+        result = {str(key): _json_safe(item, seen, depth + 1) for key, item in value.items()}
+        seen.remove(object_id)
+        return result
+    if isinstance(value, (list, tuple)):
+        seen.add(object_id)
+        result = [_json_safe(item, seen, depth + 1) for item in value]
+        seen.remove(object_id)
+        return result
+    return str(value)
+
+
+@dataclass(frozen=True)
+class Recommendation:
+    pick: str
+    probability: float
+    confidence: float
+    odds: float
+    fair_odds: float
+    value_percent: float
+    edge_percent: float
+    reason: str
+
+
 class Best3AIPredictor(AIPredictor):
     """AI analyst that ranks the three best available lines using real context."""
 
     def _request_v2(self, payload: dict) -> dict:
         url = f"{self.base_url}/chat/completions"
-        request_body = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": (
-                    "Ты профессиональный спортивный аналитик. Отвечай только на русском. "
-                    "Твоя задача — дать три лучших прогноза по силе спортивного сценария, а не просто три самых вероятных исхода. "
-                    "ОБЯЗАТЕЛЬНО сначала изучи блок спортивный_контекст. "
-                    "Если активный_источник_статистики не равен 'нет', статистика реально получена и должна использоваться. "
-                    "Если активный_источник_статистики равен 'API-SPORT.ru', API-SPORT.ru является ПРИОРИТЕТНЫМ источником: используй его данные как основу прогноза и не заменяй их данными HockeyTech, SofaScore или другого источника. "
-                    "Опирайся на конкретные цифры: последние матчи, победы/поражения, забитые и пропущенные, средние голы, H2H, таблицу, домашний/гостевой фактор. "
-                    "В первую очередь изучи поле статистика_для_ии — оно содержит выбранный основной источник. "
-                    "Не пиши 'статистика отсутствует', если в контексте есть эти поля. "
-                    "Рыночные вероятности и коэффициенты — только дополнительная информация; не копируй рыночную вероятность без спортивного обоснования. "
-                    "Для каждой выбранной линии самостоятельно оцени вероятность. "
-                    "Не выдумывай составы, травмы, форму или цифры, которых нет в контексте. "
-                    "Справедливый КФ = 100 / вероятность. Value = (коэффициент * вероятность / 100 - 1) * 100. "
-                    "Положительное value желательно, но не является обязательным: если его нет, всё равно выбери три наиболее сильных сценария и честно укажи отрицательное value. "
-                    "Уверенность 0..10 означает качество доказательств. При реальных данных о 10 последних матчах и таблице обычно можно дать 6-9, при неполных данных ниже. "
-                    "Вероятность не должна отклоняться от рынка более чем на 20 п.п., если нет сильного статистического основания. "
-                    "Верни ТОЛЬКО JSON: {\"recommendations\":[{\"pick\":\"точное название линии\",\"probability\":60,\"confidence\":7.5,\"reason\":\"...\"}],\"summary\":\"...\"}. "
-                    "Нужно ровно до 3 разных существующих линий, в порядке силы: №1 лучший, №2 второй, №3 третий. "
-                    "pick обязан дословно совпадать с переданной линией."
-                )},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-            "max_tokens": 2400,
-        }
+        safe_payload = _json_safe(payload)
+        # Serialize before creating the HTTP request. This makes the exact
+        # failure point explicit and prevents httpx from doing hidden JSON
+        # serialization of an unexpected object graph.
         try:
-            response = self.http_client.post(url, headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}, json=request_body)
+            user_content = json.dumps(safe_payload, ensure_ascii=False, allow_nan=False)
+            request_body = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": (
+                        "Ты профессиональный спортивный аналитик. Отвечай только на русском. "
+                        "Твоя задача — дать три лучших прогноза по силе спортивного сценария, а не просто три самых вероятных исхода. "
+                        "ОБЯЗАТЕЛЬНО сначала изучи блок спортивный_контекст. "
+                        "Если активный_источник_статистики не равен 'нет', статистика реально получена и должна использоваться. "
+                        "Если активный_источник_статистики равен 'API-SPORT.ru', API-SPORT.ru является ПРИОРИТЕТНЫМ источником: используй его данные как основу прогноза и не заменяй их данными HockeyTech, SofaScore или другого источника. "
+                        "Опирайся на конкретные цифры: последние матчи, победы/поражения, забитые и пропущенные, средние голы, H2H, таблицу, домашний/гостевой фактор. "
+                        "В первую очередь изучи поле статистика_для_ии — оно содержит выбранный основной источник. "
+                        "Не пиши 'статистика отсутствует', если в контексте есть эти поля. "
+                        "Рыночные вероятности и коэффициенты — только дополнительная информация; не копируй рыночную вероятность без спортивного обоснования. "
+                        "Для каждой выбранной линии самостоятельно оцени вероятность. "
+                        "Не выдумывай составы, травмы, форму или цифры, которых нет в контексте. "
+                        "Справедливый КФ = 100 / вероятность. Value = (коэффициент * вероятность / 100 - 1) * 100. "
+                        "Положительное value желательно, но не является обязательным: если его нет, всё равно выбери три наиболее сильных сценария и честно укажи отрицательное value. "
+                        "Уверенность 0..10 означает качество доказательств. При реальных данных о 10 последних матчах и таблице обычно можно дать 6-9, при неполных данных ниже. "
+                        "Вероятность не должна отклоняться от рынка более чем на 20 п.п., если нет сильного статистического основания. "
+                        "Верни ТОЛЬКО JSON: {\"recommendations\":[{\"pick\":\"точное название линии\",\"probability\":60,\"confidence\":7.5,\"reason\":\"...\"}],\"summary\":\"...\"}. "
+                        "Нужно ровно до 3 разных существующих линий, в порядке силы: №1 лучший, №2 второй, №3 третий. "
+                        "pick обязан дословно совпадать с переданной линией."
+                    )},
+                    {"role": "user", "content": user_content},
+                ],
+                "max_tokens": 2400,
+            }
+            request_json = json.dumps(request_body, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            print(f"AI prediction serialization error: {type(exc).__name__}: {exc}", flush=True)
+            raise RuntimeError(f"Не удалось подготовить данные для ИИ: {type(exc).__name__}: {exc}") from exc
+
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        try:
+            # Send already serialized JSON so httpx cannot perform a second
+            # object-graph serialization pass.
+            response = self.http_client.post(url, headers=headers, content=request_json)
             if response.status_code >= 400:
                 try:
                     detail = response.json()
@@ -65,15 +115,23 @@ class Best3AIPredictor(AIPredictor):
                 raise RuntimeError(f"AI API HTTP {response.status_code}: {detail}")
             content = response.json()["choices"][0]["message"]["content"] or ""
         except (httpx.ConnectError, httpx.ConnectTimeout):
-            payload_json = json.dumps(request_body, ensure_ascii=False)
-            command = ["curl.exe", "-4", "-sS", "--connect-timeout", "20", "--max-time", "90", "-X", "POST", url, "-H", f"Authorization: Bearer {self.api_key}", "-H", "Content-Type: application/json", "--data-binary", payload_json]
+            command = [
+                "curl.exe", "-4", "-sS", "--connect-timeout", "20", "--max-time", "90",
+                "-X", "POST", url,
+                "-H", f"Authorization: Bearer {self.api_key}",
+                "-H", "Content-Type: application/json",
+                "--data-binary", request_json,
+            ]
             hostname = urlparse(url).hostname
             if hostname == "dindindon.ru":
                 command[1:1] = ["--resolve", "dindindon.ru:443:217.26.24.242"]
             result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=100, check=False)
             if result.returncode != 0:
                 raise RuntimeError(f"AI API curl error: {(result.stderr or result.stdout).strip()[:1000]}")
-            content = json.loads(result.stdout)["choices"][0]["message"]["content"] or ""
+            try:
+                content = json.loads(result.stdout)["choices"][0]["message"]["content"] or ""
+            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                raise RuntimeError(f"Некорректный ответ AI API через curl: {result.stdout[:1000]}") from exc
         try:
             return json.loads(content)
         except json.JSONDecodeError as exc:
@@ -120,6 +178,8 @@ class Best3AIPredictor(AIPredictor):
             for m in match.markets
         ]
         quality = self._data_quality(match)
+        analysis_data = _json_safe(match.analysis_data)
+        statistics_for_ai = _json_safe(match.analysis_data.get("статистика_для_ии", {}))
         payload = {
             "спорт": match.sport.value,
             "лига": match.league,
@@ -131,8 +191,8 @@ class Best3AIPredictor(AIPredictor):
             "активный_источник_статистики": match.analysis_data.get("активный_источник_статистики", "нет"),
             "режим_источника": match.analysis_data.get("режим_источника", ""),
             "диагностика_статистики": match.analysis_data.get("диагностика_статистики", ""),
-            "статистика_для_ии": match.analysis_data.get("статистика_для_ии", {}),
-            "спортивный_контекст": match.analysis_data,
+            "статистика_для_ии": statistics_for_ai,
+            "спортивный_контекст": analysis_data,
             "доступные_линии": markets,
             "задача": "Используй реальные спортивные данные, прежде всего статистику_для_ии из API-SPORT.ru, и выбери ровно три лучших сценария в порядке силы. №1 — лучший, №2 и №3 — следующие по качеству.",
         }
