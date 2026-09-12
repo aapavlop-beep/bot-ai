@@ -2,17 +2,20 @@ from __future__ import annotations
 
 from typing import Any
 
-from .khl import KHLService
+from .models import Market, Match, Sport
 from .providers.api_sport_ru import ApiSportRuClient
 
 
-class EnhancedKHLService(KHLService):
-    """KHL service backed only by API-SPORT.ru."""
+class EnhancedKHLService:
+    """KHL service backed exclusively by API-SPORT.ru.
+
+    This class deliberately does not inherit from the legacy KHL service so
+    the HockeyTech client cannot be instantiated or queried from the active
+    KHL code path.
+    """
 
     def __init__(self, client: ApiSportRuClient) -> None:
-        # The legacy base class is retained for Match formatting helpers only.
-        # No legacy provider is queried by this service.
-        super().__init__(client)  # type: ignore[arg-type]
+        self.client = client
         self.api_sport_ru = client
 
     @staticmethod
@@ -38,12 +41,12 @@ class EnhancedKHLService(KHLService):
         except Exception:
             return raw if isinstance(raw, dict) else game
 
-    async def markets_for_game(self, game_id: int) -> tuple:
+    async def markets_for_game(self, game_id: int) -> tuple[Market, ...]:
         detail = await self.api_sport_ru.match_by_id(game_id)
         return self.api_sport_ru.markets_from_match(detail)
 
     async def analysis_for_game(self, game: dict[str, Any]) -> dict[str, Any]:
-        """Собирает весь спортивный контекст только из API-SPORT.ru."""
+        """Collect the complete pre-game context only from API-SPORT.ru."""
         detail = await self._detail(game)
         home, away = self.api_sport_ru._teams(detail)
         tournament = detail.get("tournament") or detail.get("league") or {}
@@ -75,16 +78,12 @@ class EnhancedKHLService(KHLService):
         if isinstance(pregame, dict):
             form = pregame.get("form") or pregame.get("teamForm") or {}
             h2h = pregame.get("h2h") or pregame.get("headToHead") or []
-            context["форма_хозяев"] = self.api_sport_ru._compact(
-                form.get("home") or form.get("homeTeam") if isinstance(form, dict) else {}
-            )
-            context["форма_гостей"] = self.api_sport_ru._compact(
-                form.get("away") or form.get("awayTeam") if isinstance(form, dict) else {}
-            )
+            home_form = (form.get("home") or form.get("homeTeam") or form.get("host")) if isinstance(form, dict) else {}
+            away_form = (form.get("away") or form.get("awayTeam") or form.get("guest")) if isinstance(form, dict) else {}
+            context["форма_хозяев"] = self.api_sport_ru._compact(home_form)
+            context["форма_гостей"] = self.api_sport_ru._compact(away_form)
             context["очные_встречи_api_sport_ru"] = self.api_sport_ru._compact(h2h)
 
-        # ВАЖНО: не помещаем context сам в себя. Иначе json.dumps() падает
-        # с ValueError: Circular reference detected при отправке данных в ИИ.
         context["статистика_для_ии"] = {
             "турнир": context["турнир"],
             "сезон": context["сезон"],
@@ -110,3 +109,26 @@ class EnhancedKHLService(KHLService):
             f"сезонная статистика: {'да' if quality['есть_сезонная_статистика'] else 'нет'}."
         )
         return context
+
+    @staticmethod
+    def to_match(game: dict[str, Any], markets: tuple[Market, ...] = (), analysis_data: dict[str, Any] | None = None) -> Match:
+        teams = game.get("teams") or {}
+        home_obj = teams.get("home") or {}
+        away_obj = teams.get("away") or {}
+        home = str(home_obj.get("name") or "Хозяева")
+        away = str(away_obj.get("name") or "Гости")
+        league = str((game.get("league") or {}).get("name") or "КХЛ")
+        start_time = str(game.get("date") or game.get("datetime") or "")
+        return Match(
+            sport=Sport.KHL,
+            league=league,
+            home=home,
+            away=away,
+            start_time=start_time,
+            markets=markets,
+            analysis_data=analysis_data or {},
+        )
+
+    @staticmethod
+    def format_game(match: Match) -> str:
+        return f"🏒 <b>{match.home} — {match.away}</b>\n🕒 {match.start_time}\n🏆 {match.league}"
