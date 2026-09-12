@@ -4,19 +4,16 @@ from typing import Any
 
 from .khl import KHLService
 from .providers.api_sport_ru import ApiSportRuClient
-from .providers.khl_mobile import KHLMobileClient
-from .providers.khl_sofascore import KHLScoreClient
 
 
 class EnhancedKHLService(KHLService):
-    """KHL service with API-SPORT.ru as the primary statistical source."""
+    """KHL service backed only by API-SPORT.ru."""
 
-    def __init__(self, client) -> None:
-        super().__init__(client)
-        self.khl_mobile = KHLMobileClient()
-        self.sofascore = KHLScoreClient()
-        from .config import settings
-        self.api_sport_ru = ApiSportRuClient(settings.api_sport_ru_key) if settings.api_sport_ru_key else None
+    def __init__(self, client: ApiSportRuClient) -> None:
+        # The legacy base class is retained for Match formatting helpers only.
+        # No legacy provider is queried by this service.
+        super().__init__(client)  # type: ignore[arg-type]
+        self.api_sport_ru = client
 
     @staticmethod
     def _quality(data: dict[str, Any]) -> dict[str, int | bool]:
@@ -29,152 +26,72 @@ class EnhancedKHLService(KHLService):
             "есть_сезонная_статистика": bool(q.get("есть_сезонная_статистика")),
         }
 
-    @classmethod
-    def _source_score(cls, data: dict[str, Any]) -> int:
-        q = cls._quality(data)
-        return (
-            q["история_хозяев"]
-            + q["история_гостей"]
-            + min(q["h2h"], 10)
-            + (5 if q["есть_таблица"] else 0)
-            + (2 if q["есть_сезонная_статистика"] else 0)
-        )
+    async def _detail(self, game: dict[str, Any]) -> dict[str, Any]:
+        raw = game.get("__raw_api_sport_ru")
+        match_id = game.get("id")
+        if isinstance(raw, dict):
+            match_id = raw.get("id") or match_id
+        if match_id is None:
+            return raw if isinstance(raw, dict) else game
+        try:
+            return await self.api_sport_ru.match_by_id(match_id)
+        except Exception:
+            return raw if isinstance(raw, dict) else game
 
-    @staticmethod
-    def _api_quality(api: dict[str, Any]) -> dict[str, int | bool]:
-        home_api = api.get("хозяева") or {}
-        away_api = api.get("гости") or {}
-        h = len(home_api.get("последние_матчи_api_sports") or [])
-        a = len(away_api.get("последние_матчи_api_sports") or [])
-        return {
-            "история_хозяев": h,
-            "история_гостей": a,
-            "h2h": len(api.get("очные_встречи_khl") or []),
-            "есть_таблица": bool(api.get("турнирная_таблица_khl")),
-            "есть_сезонная_статистика": bool(
-                home_api.get("сезонная_статистика_api_sports")
-                or away_api.get("сезонная_статистика_api_sports")
-            ),
-        }
+    async def markets_for_game(self, game_id: int) -> tuple:
+        detail = await self.api_sport_ru.match_by_id(game_id)
+        return self.api_sport_ru.markets_from_match(detail)
 
     async def analysis_for_game(self, game: dict[str, Any]) -> dict[str, Any]:
-        home, away = self._teams(game)
-        start = self._start_time(game)
+        detail = await self._detail(game)
+        home, away = self.api_sport_ru._teams(detail)
+        tournament = detail.get("tournament") or detail.get("league") or {}
+        season = detail.get("season") or {}
+        pregame = detail.get("pregame") or {}
+        quality = self.api_sport_ru._quality(pregame)
+
+        # API-SPORT.ru is the sole sports-data source. We deliberately do not
+        # call HockeyTech, SofaScore, API-Sports or the KHL mobile proxy here.
         context: dict[str, Any] = {
-            "источники": ["API-SPORT.ru", "Официальный KHL mobile API", "SofaScore", "API-Sports", "KHL HockeyTech"],
-            "сезон": self._season(game),
+            "источники": ["API-SPORT.ru"],
             "главный_источник_статистики": "API-SPORT.ru",
+            "активный_источник_статистики": "API-SPORT.ru",
+            "режим_источника": "API-SPORT.ru (единственный источник)",
+            "матч_найден": bool(detail.get("id") or game.get("id")),
+            "match_id": detail.get("id") or game.get("id"),
+            "турнир": self.api_sport_ru._compact(tournament),
+            "сезон": self.api_sport_ru._compact(season),
+            "команды": {"хозяева": home, "гости": away},
+            "статус": self.api_sport_ru._compact(detail.get("status")),
+            "счёт": self.api_sport_ru._compact(detail.get("homeScore")),
+            "счёт_гостей": self.api_sport_ru._compact(detail.get("awayScore")),
+            "форма_и_серии": self.api_sport_ru._compact(pregame),
+            "статистика_матча": self.api_sport_ru._compact(detail.get("matchStatistics")),
+            "события": self.api_sport_ru._compact(detail.get("liveEvents")),
+            "коэффициенты": self.api_sport_ru._compact(detail.get("oddsBase")),
+            "букмекерские_коэффициенты": self.api_sport_ru._compact(detail.get("oddsBk")),
+            "качество_данных": quality,
         }
 
-        # API-SPORT.ru is the primary source. When its match is found, its
-        # pregame/form/H2H data is the basis of the AI analysis. Other providers
-        # remain available only as fallbacks/diagnostics if API-SPORT.ru fails.
-        if self.api_sport_ru is not None:
-            try:
-                context["данные_api_sport_ru"] = await self.api_sport_ru.build_context(home, away, start)
-            except Exception as exc:
-                context["ошибка_api_sport_ru"] = f"{type(exc).__name__}: {exc}"
-        else:
-            context["ошибка_api_sport_ru"] = "API_SPORT_RU_KEY не задан"
+        # If the API provides pregame/form/H2H blocks, expose them in the
+        # names expected by the AI prompt without inventing missing values.
+        if isinstance(pregame, dict):
+            form = pregame.get("form") or pregame.get("teamForm") or {}
+            h2h = pregame.get("h2h") or pregame.get("headToHead") or []
+            context["форма_хозяев"] = self.api_sport_ru._compact(
+                form.get("home") or form.get("homeTeam") if isinstance(form, dict) else {}
+            )
+            context["форма_гостей"] = self.api_sport_ru._compact(
+                form.get("away") or form.get("awayTeam") if isinstance(form, dict) else {}
+            )
+            context["очные_встречи_api_sport_ru"] = self.api_sport_ru._compact(h2h)
 
-        # Keep secondary sources so the bot can still work if API-SPORT.ru is
-        # temporarily unavailable. They must not replace a successfully found
-        # API-SPORT.ru match as the active source.
-        try:
-            official = await self.khl_mobile.build_match_context(home, away, start)
-            context["официальные_данные_khl"] = official
-        except Exception as exc:
-            context["ошибка_официального_khl"] = f"{type(exc).__name__}: {exc}"
-
-        try:
-            context["резервные_данные_khl"] = await self.sofascore.build_context(home, away, start)
-        except Exception as exc:
-            context["ошибка_sofascore"] = f"{type(exc).__name__}: {exc}"
-
-        try:
-            context["резервные_данные_api_sports"] = await super().analysis_for_game(game)
-        except Exception as exc:
-            context["ошибка_резервных_данных"] = f"{type(exc).__name__}: {exc}"
-
-        try:
-            ht = self.khl_data
-            recent_home = await ht.recent_team_games(home, days=120, limit=10)
-            recent_away = await ht.recent_team_games(away, days=120, limit=10)
-            h2h = await ht.head_to_head(home, away, days=730, limit=10)
-            context["резервные_данные_hockeytech"] = {
-                "источник_статистики": "KHL HockeyTech",
-                "хозяева": {"команда": home, "последние_10": recent_home},
-                "гости": {"команда": away, "последние_10": recent_away},
-                "очные_встречи": h2h,
-                "качество_данных": {
-                    "история_хозяев": len(recent_home),
-                    "история_гостей": len(recent_away),
-                    "h2h": len(h2h),
-                    "есть_таблица": False,
-                    "есть_сезонная_статистика": False,
-                },
-            }
-        except Exception as exc:
-            context["ошибка_hockeytech"] = f"{type(exc).__name__}: {exc}"
-
-        api_sport_ru = context.get("данные_api_sport_ru")
-        if isinstance(api_sport_ru, dict) and api_sport_ru.get("матч_найден"):
-            q = self._quality(api_sport_ru)
-            # Deliberately give the primary provider a dominant score whenever
-            # it found the requested match. This prevents HockeyTech/SofaScore
-            # from silently becoming the source used by the AI.
-            score = 100 + self._source_score(api_sport_ru)
-            context["активный_источник_статистики"] = "API-SPORT.ru"
-            context["качество_активных_данных"] = q
-            context["статистика_для_ии"] = api_sport_ru
-            context["режим_источника"] = "API-SPORT.ru (основной)"
-        else:
-            candidates: list[tuple[str, dict[str, Any], int]] = []
-            for key in ("официальные_данные_khl", "резервные_данные_khl"):
-                data = context.get(key)
-                if isinstance(data, dict):
-                    score = self._source_score(data)
-                    if score > 0:
-                        candidates.append((str(data.get("источник_статистики", key)), data, score))
-
-            api = context.get("резервные_данные_api_sports")
-            if isinstance(api, dict):
-                q = self._api_quality(api)
-                api_score = int(q["история_хозяев"]) + int(q["история_гостей"]) + min(int(q["h2h"]), 10) + (5 if q["есть_таблица"] else 0) + (2 if q["есть_сезонная_статистика"] else 0)
-                if api_score > 0:
-                    candidates.append(("API-Sports", api, api_score))
-
-            ht = context.get("резервные_данные_hockeytech")
-            if isinstance(ht, dict):
-                score = self._source_score(ht)
-                if score > 0:
-                    candidates.append(("KHL HockeyTech", ht, score))
-
-            if candidates:
-                best_source, best_data, _ = max(candidates, key=lambda item: item[2])
-                context["активный_источник_статистики"] = best_source
-                context["качество_активных_данных"] = self._quality(best_data)
-                context["статистика_для_ии"] = best_data
-                context["режим_источника"] = f"резерв: {best_source}"
-            else:
-                context["активный_источник_статистики"] = "нет"
-                context["качество_активных_данных"] = {
-                    "история_хозяев": 0,
-                    "история_гостей": 0,
-                    "h2h": 0,
-                    "есть_таблица": False,
-                    "есть_сезонная_статистика": False,
-                }
-                context["статистика_для_ии"] = {}
-                context["режим_источника"] = "данные отсутствуют"
-
-        q = context["качество_активных_данных"]
+        context["статистика_для_ии"] = context
+        context["качество_активных_данных"] = quality
         context["диагностика_статистики"] = (
-            f"Источник: {context['активный_источник_статистики']}; "
-            f"последние матчи: хозяева {q.get('история_хозяев', 0)}, "
-            f"гости {q.get('история_гостей', 0)}; "
-            f"H2H: {q.get('h2h', 0)}; "
-            f"таблица: {'да' if q.get('есть_таблица') else 'нет'}; "
-            f"сезонная статистика: {'да' if q.get('есть_сезонная_статистика') else 'нет'}."
+            f"Источник: API-SPORT.ru; последние матчи: хозяева {quality['история_хозяев']}, "
+            f"гости {quality['история_гостей']}; H2H: {quality['h2h']}; "
+            f"таблица: {'да' if quality['есть_таблица'] else 'нет'}; "
+            f"сезонная статистика: {'да' if quality['есть_сезонная_статистика'] else 'нет'}."
         )
         return context
