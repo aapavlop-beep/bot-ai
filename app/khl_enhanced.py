@@ -43,6 +43,7 @@ class EnhancedKHLService(KHLService):
         return self.api_sport_ru.markets_from_match(detail)
 
     async def analysis_for_game(self, game: dict[str, Any]) -> dict[str, Any]:
+        """Собирает весь спортивный контекст только из API-SPORT.ru."""
         detail = await self._detail(game)
         home, away = self.api_sport_ru._teams(detail)
         tournament = detail.get("tournament") or detail.get("league") or {}
@@ -50,8 +51,6 @@ class EnhancedKHLService(KHLService):
         pregame = detail.get("pregame") or {}
         quality = self.api_sport_ru._quality(pregame)
 
-        # API-SPORT.ru is the sole sports-data source. We deliberately do not
-        # call HockeyTech, SofaScore, API-Sports or the KHL mobile proxy here.
         context: dict[str, Any] = {
             "источники": ["API-SPORT.ru"],
             "главный_источник_статистики": "API-SPORT.ru",
@@ -73,8 +72,6 @@ class EnhancedKHLService(KHLService):
             "качество_данных": quality,
         }
 
-        # If the API provides pregame/form/H2H blocks, expose them in the
-        # names expected by the AI prompt without inventing missing values.
         if isinstance(pregame, dict):
             form = pregame.get("form") or pregame.get("teamForm") or {}
             h2h = pregame.get("h2h") or pregame.get("headToHead") or []
@@ -86,7 +83,25 @@ class EnhancedKHLService(KHLService):
             )
             context["очные_встречи_api_sport_ru"] = self.api_sport_ru._compact(h2h)
 
-        context["статистика_для_ии"] = context
+        # ВАЖНО: не помещаем context сам в себя. Иначе json.dumps() падает
+        # с ValueError: Circular reference detected при отправке данных в ИИ.
+        context["статистика_для_ии"] = {
+            "турнир": context["турнир"],
+            "сезон": context["сезон"],
+            "команды": context["команды"],
+            "статус": context["статус"],
+            "счёт": context["счёт"],
+            "счёт_гостей": context["счёт_гостей"],
+            "форма_и_серии": context["форма_и_серии"],
+            "форма_хозяев": context.get("форма_хозяев", {}),
+            "форма_гостей": context.get("форма_гостей", {}),
+            "очные_встречи_api_sport_ru": context.get("очные_встречи_api_sport_ru", []),
+            "статистика_матча": context["статистика_матча"],
+            "события": context["события"],
+            "коэффициенты": context["коэффициенты"],
+            "букмекерские_коэффициенты": context["букмекерские_коэффициенты"],
+            "качество_данных": quality,
+        }
         context["качество_активных_данных"] = quality
         context["диагностика_статистики"] = (
             f"Источник: API-SPORT.ru; последние матчи: хозяева {quality['история_хозяев']}, "
