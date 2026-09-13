@@ -5,12 +5,8 @@ class Settings(BaseSettings):
     bot_token: str
     log_level: str = "INFO"
     app_env: str = "development"
-    odds_api_key: str | None = None
-    odds_api_regions: str = "eu"
-    api_sports_key: str | None = None
-    api_sport_ru_key: str | None = None
 
-    # OpenAI-compatible API (official OpenAI or another compatible provider).
+    # Sports facts and bookmaker lines are collected only by browser research.
     openai_api_key: str | None = None
     openai_base_url: str | None = None
     openai_model: str = "gpt-6-astra"
