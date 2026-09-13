@@ -8,11 +8,18 @@ from .khl_schedule import verified_today_games
 
 
 class KHLBackgroundCache:
-    """Keeps the KHL schedule, markets and statistics fresh while the bot runs."""
+    """Cache only the daily KHL feed.
 
-    def __init__(self, service, interval_minutes: int = 60) -> None:
+    The previous implementation expanded one schedule request into multiple
+    detail/statistics requests for every match every hour. That could consume
+    the API quota before a user even opened a match. Context and odds are now
+    loaded lazily for the selected match, with provider-level caching handling
+    repeated requests.
+    """
+
+    def __init__(self, service, interval_minutes: int = 30) -> None:
         self.service = service
-        self.interval_seconds = max(15, interval_minutes * 60)
+        self.interval_seconds = max(60, interval_minutes * 60)
         self.games: list[dict[str, Any]] = []
         self.context: dict[int, tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = {}
         self.updated_at: float = 0.0
@@ -24,29 +31,17 @@ class KHLBackgroundCache:
             return
         async with self.lock:
             try:
-                games = await verified_today_games(self.service.client)
-                self.games = games
-
-                # Warm the data used by predictions. AI calls are deliberately
-                # excluded; only sports data and betting markets are refreshed.
-                for game in games:
-                    game_id = game.get("id")
-                    if game_id is None:
-                        continue
-                    try:
-                        markets = await self.service.markets_for_game(int(game_id))
-                        analysis = await self.service.analysis_for_game(game)
-                        self.context[int(game_id)] = (game, markets, analysis)
-                    except Exception as exc:
-                        print(f"KHL background refresh: game {game_id}: {type(exc).__name__}: {exc}")
-
-                # Remove games that are no longer on today's schedule.
-                valid_ids = {int(g["id"]) for g in games if g.get("id") is not None}
-                self.context = {key: value for key, value in self.context.items() if key in valid_ids}
+                # Exactly one API request for the whole KHL schedule. The
+                # response already contains teams and, when available, odds.
+                self.games = await verified_today_games(self.service.client)
                 self.updated_at = time.time()
-                print(f"KHL background refresh: {len(games)} games, {len(self.context)} fully refreshed")
+                print(
+                    f"KHL background refresh: {len(self.games)} games; "
+                    f"API requests total={self.service.client.request_count}",
+                    flush=True,
+                )
             except Exception as exc:
-                print(f"KHL background refresh failed: {type(exc).__name__}: {exc}")
+                print(f"KHL background refresh failed: {type(exc).__name__}: {exc}", flush=True)
 
     async def loop(self) -> None:
         await self.refresh()
