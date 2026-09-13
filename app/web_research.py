@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import quote_plus, urlparse
 
-import httpx
 from bs4 import BeautifulSoup
+from playwright.async_api import Browser, Page, async_playwright
 
 
 @dataclass(frozen=True)
@@ -21,37 +21,36 @@ class SearchResult:
 
 
 class KHLWebResearcher:
-    """Build a source-attributed KHL research dossier from public browser pages."""
+    """Real Chromium-based web research for KHL.
 
-    CACHE_TTL = 30 * 60
-    MAX_RESULTS_PER_QUERY = 6
-    MAX_PAGES = 36
-    MAX_TEXT_PER_PAGE = 6500
-    REQUEST_TIMEOUT = 15.0
+    Sports data is collected only by opening public web pages in Chromium.
+    No sports API, API-SPORT, SofaScore or direct search-engine HTTP requests
+    are used by this class.
+    """
+
+    CACHE_TTL = 20 * 60
+    MAX_RESULTS_PER_QUERY = 8
+    MAX_PAGES = 20
+    MAX_TEXT_PER_PAGE = 8000
+    NAV_TIMEOUT = 25_000
+    SEARCH_DELAY = 0.8
 
     OFFICIAL = {"khl.ru", "fhr.ru"}
     SPORTS_MEDIA = {
         "sports.ru", "championat.com", "matchtv.ru", "allhockey.ru",
-        "sport-express.ru", "metaratings.ru", "rsport.ria.ru",
+        "sport-express.ru", "metaratings.ru", "rsport.ria.ru", "ria.ru",
+        "prosports.ru", "vprognoze.ru", "bookmaker-ratings.ru",
     }
     BOOKMAKER_HINTS = {
-        "winline.ru", "fon.bet", "fonbet.ru", "fonbet.kz",
-        "betboom.ru", "parimatch.com", "parimatch.ru",
+        "winline.ru", "fon.bet", "fonbet.ru", "betboom.ru",
+        "parimatch.com", "parimatch.ru",
     }
 
     def __init__(self) -> None:
         self._cache: dict[str, tuple[float, dict]] = {}
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(self.REQUEST_TIMEOUT, connect=8.0),
-            follow_redirects=True,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0 Safari/537.36"
-                ),
-                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.7",
-            },
-        )
+        self._playwright = None
+        self._browser: Browser | None = None
+        self._lock = asyncio.Lock()
 
     @staticmethod
     def _clean(value: str) -> str:
@@ -66,10 +65,10 @@ class KHLWebResearcher:
         host = cls._host(url)
         if host in cls.OFFICIAL or any(host.endswith("." + d) for d in cls.OFFICIAL):
             return "official"
-        if host in cls.SPORTS_MEDIA or any(host.endswith("." + d) for d in cls.SPORTS_MEDIA):
-            return "sports_media"
         if host in cls.BOOKMAKER_HINTS or any(host.endswith("." + d) for d in cls.BOOKMAKER_HINTS):
             return "bookmaker"
+        if host in cls.SPORTS_MEDIA or any(host.endswith("." + d) for d in cls.SPORTS_MEDIA):
+            return "sports_media"
         return "other"
 
     @classmethod
@@ -90,101 +89,138 @@ class KHLWebResearcher:
             if node and node.get("content"):
                 return str(node.get("content")).strip()
         node = soup.find("time")
-        if node:
-            return str(node.get("datetime") or node.get_text(" ", strip=True) or "").strip()
-        return ""
+        return str(node.get("datetime") or node.get_text(" ", strip=True) or "").strip() if node else ""
 
-    async def _search_google(self, query: str) -> list[SearchResult]:
+    async def _ensure_browser(self) -> Browser:
+        async with self._lock:
+            if self._browser is not None and self._browser.is_connected():
+                return self._browser
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            )
+            print("KHL browser research: Chromium started", flush=True)
+            return self._browser
+
+    async def _new_page(self) -> Page:
+        browser = await self._ensure_browser()
+        context = await browser.new_context(
+            locale="ru-RU",
+            timezone_id="Europe/Moscow",
+            viewport={"width": 1440, "height": 1000},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+            ),
+            extra_http_headers={"Accept-Language": "ru-RU,ru;q=0.9,en;q=0.7"},
+        )
+        return await context.new_page()
+
+    async def close(self) -> None:
+        async with self._lock:
+            if self._browser is not None:
+                await self._browser.close()
+                self._browser = None
+            if self._playwright is not None:
+                await self._playwright.stop()
+                self._playwright = None
+
+    async def _search_yandex(self, page: Page, query: str) -> list[SearchResult]:
+        url = "https://ya.ru/search/?text=" + quote_plus(query)
+        await page.goto(url, wait_until="domcontentloaded", timeout=self.NAV_TIMEOUT)
+        await page.wait_for_timeout(1200)
+        results: list[SearchResult] = []
+        cards = page.locator("li.serp-item, [data-cid], .Organic")
+        for i in range(min(await cards.count(), 20)):
+            card = cards.nth(i)
+            try:
+                href = await card.locator("a[href]").first.get_attribute("href", timeout=1200)
+                title = self._clean(await card.locator("h2, .OrganicTitleContentSpan, [role='heading']").first.inner_text(timeout=1200))
+                text = self._clean(await card.inner_text(timeout=1500))
+            except Exception:
+                continue
+            if not href or not href.startswith("http") or not title:
+                continue
+            if self._host(href).endswith(("ya.ru", "yandex.ru")):
+                continue
+            results.append(SearchResult(title, href, text[:1800]))
+        return results[: self.MAX_RESULTS_PER_QUERY]
+
+    async def _search_bing(self, page: Page, query: str) -> list[SearchResult]:
+        url = "https://www.bing.com/search?q=" + quote_plus(query) + "&setlang=ru&count=10"
+        await page.goto(url, wait_until="domcontentloaded", timeout=self.NAV_TIMEOUT)
+        await page.wait_for_timeout(700)
+        results: list[SearchResult] = []
+        cards = page.locator("li.b_algo")
+        for i in range(min(await cards.count(), 12)):
+            card = cards.nth(i)
+            try:
+                link = card.locator("h2 a[href]").first
+                href = await link.get_attribute("href", timeout=1200)
+                title = self._clean(await link.inner_text(timeout=1200))
+                snippet = self._clean(await card.inner_text(timeout=1200))
+            except Exception:
+                continue
+            if href and href.startswith("http") and title:
+                results.append(SearchResult(title, href, snippet[:1800]))
+        return results[: self.MAX_RESULTS_PER_QUERY]
+
+    async def _search_google(self, page: Page, query: str) -> list[SearchResult]:
         url = "https://www.google.com/search?q=" + quote_plus(query) + "&hl=ru&num=10"
-        response = await self._client.get(url)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
+        await page.goto(url, wait_until="domcontentloaded", timeout=self.NAV_TIMEOUT)
+        await page.wait_for_timeout(700)
         results: list[SearchResult] = []
-        for block in soup.select("div.MjjYud"):
-            link = block.select_one("a[href]")
-            title_node = block.select_one("h3")
-            if not link or not title_node:
+        cards = page.locator("div.MjjYud")
+        for i in range(min(await cards.count(), 12)):
+            card = cards.nth(i)
+            try:
+                link = card.locator("a[href]").first
+                title_node = card.locator("h3").first
+                href = await link.get_attribute("href", timeout=1200)
+                title = self._clean(await title_node.inner_text(timeout=1200))
+                snippet = self._clean(await card.inner_text(timeout=1200))
+            except Exception:
                 continue
-            href = str(link.get("href") or "")
-            if href.startswith("/url?q="):
-                href = href.split("/url?q=", 1)[1].split("&", 1)[0]
-            if not href.startswith("http"):
-                continue
-            snippet_node = block.select_one(".VwiC3b") or block.select_one("div[data-sncf]")
-            results.append(SearchResult(
-                title=self._clean(title_node.get_text(" ", strip=True)),
-                url=href,
-                snippet=self._clean(snippet_node.get_text(" ", strip=True)) if snippet_node else "",
-            ))
-        return results
-
-    async def _search_bing(self, query: str) -> list[SearchResult]:
-        url = "https://www.bing.com/search?q=" + quote_plus(query) + "&setlang=ru"
-        response = await self._client.get(url)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        results: list[SearchResult] = []
-        for block in soup.select("li.b_algo"):
-            link = block.select_one("h2 a[href]")
-            if not link:
-                continue
-            snippet = block.select_one(".b_caption p")
-            results.append(SearchResult(
-                title=self._clean(link.get_text(" ", strip=True)),
-                url=str(link.get("href") or ""),
-                snippet=self._clean(snippet.get_text(" ", strip=True)) if snippet else "",
-            ))
-        return results
-
-    async def _search_duckduckgo(self, query: str) -> list[SearchResult]:
-        url = "https://html.duckduckgo.com/html/?q=" + quote_plus(query)
-        response = await self._client.get(url)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        results: list[SearchResult] = []
-        for block in soup.select(".result"):
-            link = block.select_one(".result__a[href]")
-            if not link:
-                continue
-            snippet = block.select_one(".result__snippet")
-            results.append(SearchResult(
-                title=self._clean(link.get_text(" ", strip=True)),
-                url=str(link.get("href") or ""),
-                snippet=self._clean(snippet.get_text(" ", strip=True)) if snippet else "",
-            ))
-        return results
+            if href and href.startswith("http") and title:
+                results.append(SearchResult(title, href, snippet[:1800]))
+        return results[: self.MAX_RESULTS_PER_QUERY]
 
     async def search(self, query: str) -> list[SearchResult]:
-        # Google is currently rate-limiting the Railway IP. Prefer Bing/DDG so
-        # browser research remains operational instead of failing the whole job.
-        for engine in (self._search_bing, self._search_duckduckgo, self._search_google):
-            try:
-                results = await engine(query)
-                if results:
-                    return results[: self.MAX_RESULTS_PER_QUERY]
-            except Exception as exc:
-                print(f"KHL web search failed ({engine.__name__}): {type(exc).__name__}: {exc}", flush=True)
-        return []
-
-    async def _extract_page(self, result: SearchResult) -> SearchResult:
+        """Search through a real Chromium tab. Yandex is primary."""
+        page = await self._new_page()
         try:
-            response = await self._client.get(result.url)
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "")
-            if "text/html" not in content_type:
-                return result
-            soup = BeautifulSoup(response.text, "html.parser")
+            for name, engine in (("Yandex", self._search_yandex), ("Bing", self._search_bing), ("Google", self._search_google)):
+                try:
+                    results = await engine(page, query)
+                    if results:
+                        print(f"KHL browser search: {name} -> {len(results)} results | {query}", flush=True)
+                        return results
+                except Exception as exc:
+                    print(f"KHL browser search failed ({name}): {type(exc).__name__}: {exc}", flush=True)
+            return []
+        finally:
+            await page.context.close()
+
+    async def fetch_page(self, url: str) -> SearchResult:
+        page = await self._new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=self.NAV_TIMEOUT)
+            await page.wait_for_timeout(900)
+            html = await page.content()
+            soup = BeautifulSoup(html, "html.parser")
             published_at = self._extract_published_at(soup)
-            for node in soup.select("script,style,noscript,svg,nav,footer,header,form"):
+            for node in soup.select("script,style,noscript,svg,nav,footer,header,form,iframe"):
                 node.decompose()
             root = soup.select_one("article") or soup.select_one("main") or soup.body
-            if root is None:
-                return SearchResult(result.title, result.url, result.snippet, "", published_at)
-            text = self._clean(root.get_text(" ", strip=True))
-            return SearchResult(result.title, result.url, result.snippet, text[: self.MAX_TEXT_PER_PAGE], published_at)
+            text = self._clean(root.get_text(" ", strip=True)) if root else ""
+            title = self._clean(await page.title())
+            return SearchResult(title, url, text[:1800], text[: self.MAX_TEXT_PER_PAGE], published_at)
         except Exception as exc:
-            print(f"KHL web page failed: {result.url}: {type(exc).__name__}: {exc}", flush=True)
-            return result
+            print(f"KHL browser page failed: {url}: {type(exc).__name__}: {exc}", flush=True)
+            return SearchResult("", url, "")
+        finally:
+            await page.context.close()
 
     @staticmethod
     def _queries(home: str, away: str, date: str) -> list[str]:
@@ -192,50 +228,43 @@ class KHLWebResearcher:
         return [
             f"{pair} {date} состав травмы дисквалификация",
             f"{pair} {date} стартовый состав вратарь",
-            f"{pair} последние 5 матчей результаты форма",
-            f"{pair} последние 10 матчей результаты статистика",
-            f"{pair} очные встречи H2H",
-            f"{home} КХЛ состав травмы дисквалификация {date}",
-            f"{away} КХЛ состав травмы дисквалификация {date}",
-            f"{home} КХЛ вероятный вратарь {date}",
-            f"{away} КХЛ вероятный вратарь {date}",
-            "КХЛ таблица 2026 2027 турнирная таблица",
+            f"{pair} {date} вероятный состав",
+            f"{pair} последние 5 матчей форма результаты",
+            f"{home} КХЛ последние 5 матчей результаты {date}",
+            f"{away} КХЛ последние 5 матчей результаты {date}",
+            f"{pair} очные встречи H2H статистика",
+            f"КХЛ турнирная таблица 2026 2027 {home} {away}",
+            f"{home} КХЛ травмы новости {date}",
+            f"{away} КХЛ травмы новости {date}",
+            f"{pair} тренер пресс конференция новости {date}",
+            f"site:khl.ru {pair} {date}",
+            f"site:khl.ru {home} травма состав {date}",
+            f"site:khl.ru {away} травма состав {date}",
             f"{pair} коэффициенты Winline Фонбет BetBoom Parimatch {date}",
-            f"{pair} линия П1 X П2 Winline Фонбет BetBoom Parimatch {date}",
-            f"{pair} коэффициенты 1 X 2 Winline Фонбет BetBoom Parimatch {date}",
             f"site:winline.ru {home} {away} {date}",
             f"site:fon.bet {home} {away} {date}",
             f"site:fonbet.ru {home} {away} {date}",
             f"site:betboom.ru {home} {away} {date}",
             f"site:parimatch.com {home} {away} {date}",
-            f"site:parimatch.ru {home} {away} {date}",
-            f"site:khl.ru {home} {away} {date}",
-            f"site:khl.ru {home} травма состав {date}",
-            f"site:khl.ru {away} травма состав {date}",
-            f"site:khl.ru {home} {away} вратарь {date}",
         ]
 
     @staticmethod
     def _bucket(text: str) -> list[str]:
         low = text.lower()
-        buckets: list[str] = []
         patterns = {
             "match": ("матч", "начало", "расписан", "сегодня", "завтра"),
             "lineups": ("состав", "звено", "заявк", "линия"),
-            "injuries": ("травм", "поврежд", "не сыгра", "больн", "в лазарете"),
+            "injuries": ("травм", "поврежд", "не сыгра", "больн", "лазарет"),
             "suspensions": ("дисквалифик", "штраф", "дисциплинар"),
             "goalies": ("вратар", "голкипер", "стартов", "ворота"),
-            "form": ("последн", "побед", "пораж", "серия", "результат"),
+            "form": ("последн", "побед", "пораж", "серия", "результат", "форма"),
             "h2h": ("личн", "очная", "h2h", "встреч"),
             "standings": ("таблиц", "место", "очки", "турнирн"),
             "travel": ("перелет", "перелёт", "выезд", "дорог", "часов"),
-            "odds": ("коэффициент", "коэф", "кф", "ставк", "линия", "п1", "п2", "x ", "1 x 2"),
+            "odds": ("коэффициент", "коэф", "кф", "ставк", "линия", "п1", "п2", "1 x 2"),
             "news": ("новост", "интервью", "тренер", "пресс-конференц"),
         }
-        for bucket, words in patterns.items():
-            if any(word in low for word in words):
-                buckets.append(bucket)
-        return buckets or ["other"]
+        return [key for key, words in patterns.items() if any(word in low for word in words)] or ["other"]
 
     async def research_match(self, home: str, away: str, date: str) -> dict:
         key = f"{home}|{away}|{date}".lower()
@@ -244,42 +273,48 @@ class KHLWebResearcher:
             return cached[1]
 
         queries = self._queries(home, away, date)
-        query_results = await asyncio.gather(*(self.search(q) for q in queries), return_exceptions=True)
         unique: dict[str, SearchResult] = {}
-        for results in query_results:
-            if not isinstance(results, list):
-                continue
-            for item in results:
-                host = self._host(item.url)
-                if not item.url.startswith("http") or host.endswith("google.com") or host.endswith("bing.com") or host.endswith("duckduckgo.com"):
-                    continue
-                if item.url not in unique:
-                    unique[item.url] = item
+        page = await self._new_page()
+        try:
+            for query in queries:
+                results: list[SearchResult] = []
+                for name, engine in (("Yandex", self._search_yandex), ("Bing", self._search_bing), ("Google", self._search_google)):
+                    try:
+                        results = await engine(page, query)
+                        if results:
+                            print(f"KHL browser research search: {name} -> {len(results)} | {query}", flush=True)
+                            break
+                    except Exception as exc:
+                        print(f"KHL browser research search failed ({name}): {type(exc).__name__}: {exc}", flush=True)
+                for item in results:
+                    host = self._host(item.url)
+                    if host.endswith(("yandex.ru", "ya.ru", "bing.com", "google.com")):
+                        continue
+                    unique.setdefault(item.url, item)
+                await page.wait_for_timeout(int(self.SEARCH_DELAY * 1000))
+        finally:
+            await page.context.close()
 
         all_results = list(unique.values())
-        bookmaker_results = [x for x in all_results if self._source_type(x.url) == "bookmaker"]
-        other_results = [x for x in all_results if self._source_type(x.url) != "bookmaker"]
-        bookmaker_results.sort(key=lambda x: bool(x.snippet), reverse=True)
-        other_results.sort(key=lambda x: (self._source_priority(x.url), bool(x.snippet)), reverse=True)
-        candidates = (bookmaker_results[:12] + other_results[: max(0, self.MAX_PAGES - min(12, len(bookmaker_results)))])[: self.MAX_PAGES]
+        all_results.sort(key=lambda x: (self._source_priority(x.url), bool(x.snippet)), reverse=True)
+        candidates = all_results[: self.MAX_PAGES]
+        pages = await asyncio.gather(*(self.fetch_page(item.url) for item in candidates), return_exceptions=True)
 
-        pages = await asyncio.gather(*(self._extract_page(item) for item in candidates), return_exceptions=True)
         sources: list[dict] = []
-        for page in pages:
-            if not isinstance(page, SearchResult):
-                continue
-            text = page.text or page.snippet
+        for original, loaded in zip(candidates, pages):
+            page_result = loaded if isinstance(loaded, SearchResult) else original
+            text = page_result.text or page_result.snippet
             if not text:
                 continue
             sources.append({
-                "заголовок": page.title,
-                "url": page.url,
-                "домен": self._host(page.url),
-                "тип_источника": self._source_type(page.url),
-                "приоритет": self._source_priority(page.url),
-                "дата_публикации": page.published_at,
-                "категории": self._bucket(page.title + " " + text),
-                "сниппет": page.snippet,
+                "заголовок": page_result.title or original.title,
+                "url": page_result.url,
+                "домен": self._host(page_result.url),
+                "тип_источника": self._source_type(page_result.url),
+                "приоритет": self._source_priority(page_result.url),
+                "дата_публикации": page_result.published_at,
+                "категории": self._bucket((page_result.title or original.title) + " " + text),
+                "сниппет": original.snippet,
                 "текст": text,
             })
 
@@ -287,28 +322,23 @@ class KHLWebResearcher:
         for source in sources:
             for category in source["категории"]:
                 categories.setdefault(category, []).append(source)
-        evidence = {category: items[:6] for category, items in categories.items()}
-        now = datetime.now(timezone.utc).isoformat()
+        evidence = {category: items[:8] for category, items in categories.items()}
         result = {
-            "собрано_в_utc": now,
+            "собрано_в_utc": datetime.now(timezone.utc).isoformat(),
             "матч": f"{home} — {away}",
             "дата_матча": date,
-            "метод": "Bing/DuckDuckGo/Google browser search + HTML page extraction",
+            "метод": "Chromium/Yandex+Bing+Google browser research + public page reading",
             "запросов": queries,
             "источников_всего": len(sources),
             "источников_линии": sum(1 for x in sources if x.get("тип_источника") == "bookmaker"),
             "источников": sources,
             "структурированные_доказательства": evidence,
             "правило_достоверности": (
-                "Факт считается подтверждённым только при наличии текста или сниппета источника. "
-                "Не считать отсутствие игрока травмой без явного подтверждения. "
-                "Для кадровых новостей и коэффициентов учитывать свежесть и источник. "
-                "Коэффициент из поисковой выдачи является кандидатом, а не подтверждённой линией. "
-                "При конфликте источников приоритет: официальный KHL/клуб, затем крупное спортивное СМИ, затем прочие источники."
+                "Факт принимается только при наличии текста или сниппета публичного источника. "
+                "Отсутствие игрока в составе не считается доказательством травмы. "
+                "Свежие кадровые новости имеют приоритет над старыми."
             ),
         }
         self._cache[key] = (time.time(), result)
+        print(f"KHL browser research complete: {home} — {away} sources={len(sources)}", flush=True)
         return result
-
-    async def aclose(self) -> None:
-        await self._client.aclose()
