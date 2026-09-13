@@ -4,36 +4,38 @@ cd /d "%~dp0"
 
 echo === BOT-AI local setup ===
 echo.
-if defined BOT_TOKEN (
-    echo BOT_TOKEN already exists in Windows environment.
-    echo No .env file is required.
-    echo.
-    pause
-    exit /b 0
-)
-
-echo Enter the Telegram bot token. It will be stored in your Windows user environment,
-echo NOT in GitHub and NOT in the repository.
+echo This setup stores configuration in your Windows user environment.
+echo Secrets are NOT committed to GitHub.
 echo.
-set /p "BOT_TOKEN=BOT_TOKEN: "
-if "%BOT_TOKEN%"=="" (
-    echo.
-    echo ERROR: BOT_TOKEN is empty.
-    pause
-    exit /b 1
-)
 
+set /p "BOT_TOKEN=Telegram BOT_TOKEN: "
+if "%BOT_TOKEN%"=="" goto :empty
 setx BOT_TOKEN "%BOT_TOKEN%" >nul
-if errorlevel 1 (
-    echo.
-    echo ERROR: Could not save BOT_TOKEN to Windows environment.
-    pause
-    exit /b 1
-)
+
+set /p "OPENAI_API_KEY=OpenAI API key: "
+if "%OPENAI_API_KEY%"=="" goto :empty
+setx OPENAI_API_KEY "%OPENAI_API_KEY%" >nul
+
+set /p "OPENAI_BASE_URL=OpenAI base URL (press Enter for default): "
+if not "%OPENAI_BASE_URL%"=="" setx OPENAI_BASE_URL "%OPENAI_BASE_URL%" >nul
+
+set /p "OPENAI_MODEL=OpenAI model (press Enter for default): "
+if not "%OPENAI_MODEL%"=="" setx OPENAI_MODEL "%OPENAI_MODEL%" >nul
+
+setx LOG_LEVEL "INFO" >nul
+setx APP_ENV "development" >nul
+setx DATABASE_PATH "data/bot.db" >nul
 
 echo.
-echo BOT_TOKEN saved successfully.
-echo IMPORTANT: close this CMD window and open a new one so Windows loads the variable.
+echo Configuration saved to Windows user environment.
+echo IMPORTANT: close this CMD window and open a new one.
 echo Then run:
 echo   python -m app.main
 pause
+exit /b 0
+
+:empty
+echo.
+echo ERROR: A required value was empty. Nothing else was configured.
+pause
+exit /b 1
