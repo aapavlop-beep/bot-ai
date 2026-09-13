@@ -21,29 +21,24 @@ class SearchResult:
 
 
 class KHLWebResearcher:
-    """Build a source-attributed KHL research dossier from public web pages.
-
-    Search is deliberately independent from sports APIs. The collector does not
-    invent injuries, lineups, goalies or odds: every claim remains tied to a
-    source page/snippet and publication date when the page exposes one.
-    """
+    """Build a source-attributed KHL research dossier from public web pages."""
 
     CACHE_TTL = 30 * 60
-    MAX_RESULTS_PER_QUERY = 4
-    MAX_PAGES = 24
+    MAX_RESULTS_PER_QUERY = 6
+    MAX_PAGES = 36
     MAX_TEXT_PER_PAGE = 6500
     REQUEST_TIMEOUT = 15.0
 
-    OFFICIAL = {
-        "khl.ru", "fhr.ru",
-    }
+    OFFICIAL = {"khl.ru", "fhr.ru"}
     SPORTS_MEDIA = {
         "sports.ru", "championat.com", "matchtv.ru", "allhockey.ru",
         "sport-express.ru", "metaratings.ru", "rsport.ria.ru",
     }
     BOOKMAKER_HINTS = {
-        "fon.bet", "fonbet.ru", "betboom.ru", "betcity.ru", "olimp.bet",
-        "ligastavok.ru", "winline.ru", "bettery.ru",
+        "fon.bet", "fonbet.ru", "fonbet.kz", "betboom.ru", "betcity.ru",
+        "olimp.bet", "ligastavok.ru", "winline.ru", "bettery.ru", "leon.ru",
+        "legalbet.ru", "legalbet.kz", "legalbet.tj", "vprognoze.ru", "vprognoze.kz",
+        "bookmaker-ratings.ru",
     }
 
     def __init__(self) -> None:
@@ -54,8 +49,7 @@ class KHLWebResearcher:
             headers={
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/139.0 Safari/537.36"
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0 Safari/537.36"
                 ),
                 "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.7",
             },
@@ -190,6 +184,15 @@ class KHLWebResearcher:
             f"КХЛ таблица 2026 2027 турнирная таблица",
             f"{pair} коэффициенты букмекеров {date}",
             f"{pair} линия П1 X П2 {date}",
+            f"{pair} коэффициенты 1 X 2 {date}",
+            f"{pair} П1 X П2 кэф {date}",
+            f"site:fon.bet {home} {away} {date}",
+            f"site:fonbet.ru {home} {away} {date}",
+            f"site:olimp.bet {home} {away} {date}",
+            f"site:bettery.ru {home} {away} {date}",
+            f"site:legalbet.ru {home} {away} {date}",
+            f"site:vprognoze.ru {home} {away} {date}",
+            f"site:bookmaker-ratings.ru {home} {away} {date}",
             f"site:khl.ru {home} {away} {date}",
             f"site:khl.ru {home} травма состав {date}",
             f"site:khl.ru {away} травма состав {date}",
@@ -210,7 +213,7 @@ class KHLWebResearcher:
             "h2h": ("личн", "очная", "h2h", "встреч"),
             "standings": ("таблиц", "место", "очки", "турнирн"),
             "travel": ("перелет", "перелёт", "выезд", "дорог", "часов"),
-            "odds": ("коэффициент", "кф", "ставк", "линия", "п1", "п2"),
+            "odds": ("коэффициент", "коэф", "кф", "ставк", "линия", "п1", "п2", "x ", "1 x 2"),
             "news": ("новост", "интервью", "тренер", "пресс-конференц"),
         }
         for bucket, words in patterns.items():
@@ -234,19 +237,19 @@ class KHLWebResearcher:
                 host = self._host(item.url)
                 if not item.url.startswith("http") or host.endswith("google.com") or host.endswith("bing.com"):
                     continue
-                # Prefer official and established sports sources when the same
-                # story is indexed more than once.
-                previous = unique.get(item.url)
-                if previous is None:
+                if item.url not in unique:
                     unique[item.url] = item
 
-        candidates = sorted(
-            unique.values(),
-            key=lambda x: (self._source_priority(x.url), bool(x.snippet)),
-            reverse=True,
-        )[: self.MAX_PAGES]
-        pages = await asyncio.gather(*(self._extract_page(item) for item in candidates), return_exceptions=True)
+        all_results = list(unique.values())
+        bookmaker_results = [x for x in all_results if self._source_type(x.url) == "bookmaker"]
+        other_results = [x for x in all_results if self._source_type(x.url) != "bookmaker"]
+        bookmaker_results.sort(key=lambda x: bool(x.snippet), reverse=True)
+        other_results.sort(key=lambda x: (self._source_priority(x.url), bool(x.snippet)), reverse=True)
+        # Force bookmaker evidence into the fetched set. Previously the 24-page
+        # priority sort could crowd every bookmaker page out with KHL/media pages.
+        candidates = (bookmaker_results[:12] + other_results[: max(0, self.MAX_PAGES - min(12, len(bookmaker_results)))])[: self.MAX_PAGES]
 
+        pages = await asyncio.gather(*(self._extract_page(item) for item in candidates), return_exceptions=True)
         sources: list[dict] = []
         for page in pages:
             if not isinstance(page, SearchResult):
@@ -270,13 +273,7 @@ class KHLWebResearcher:
         for source in sources:
             for category in source["категории"]:
                 categories.setdefault(category, []).append(source)
-
-        # Keep the AI prompt manageable: each category gets its best few sources,
-        # while the full source list is still preserved for diagnostics.
-        evidence = {
-            category: items[:4]
-            for category, items in categories.items()
-        }
+        evidence = {category: items[:6] for category, items in categories.items()}
         now = datetime.now(timezone.utc).isoformat()
         result = {
             "собрано_в_utc": now,
@@ -285,6 +282,7 @@ class KHLWebResearcher:
             "метод": "Google/Bing web search + HTML page extraction",
             "запросов": queries,
             "источников_всего": len(sources),
+            "источников_линии": sum(1 for x in sources if x.get("тип_источника") == "bookmaker"),
             "источников": sources,
             "структурированные_доказательства": evidence,
             "правило_достоверности": (
