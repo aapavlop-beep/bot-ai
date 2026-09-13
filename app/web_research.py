@@ -21,7 +21,7 @@ class SearchResult:
 
 
 class KHLWebResearcher:
-    """Build a source-attributed KHL research dossier from public web pages."""
+    """Build a source-attributed KHL research dossier from public browser pages."""
 
     CACHE_TTL = 30 * 60
     MAX_RESULTS_PER_QUERY = 6
@@ -34,12 +34,9 @@ class KHLWebResearcher:
         "sports.ru", "championat.com", "matchtv.ru", "allhockey.ru",
         "sport-express.ru", "metaratings.ru", "rsport.ria.ru",
     }
-    # Only the four requested bookmakers are treated as bookmaker line sources.
     BOOKMAKER_HINTS = {
-        "winline.ru",
-        "fon.bet", "fonbet.ru", "fonbet.kz",
-        "betboom.ru",
-        "parimatch.com", "parimatch.ru",
+        "winline.ru", "fon.bet", "fonbet.ru", "fonbet.kz",
+        "betboom.ru", "parimatch.com", "parimatch.ru",
     }
 
     def __init__(self) -> None:
@@ -139,8 +136,28 @@ class KHLWebResearcher:
             ))
         return results
 
+    async def _search_duckduckgo(self, query: str) -> list[SearchResult]:
+        url = "https://html.duckduckgo.com/html/?q=" + quote_plus(query)
+        response = await self._client.get(url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        results: list[SearchResult] = []
+        for block in soup.select(".result"):
+            link = block.select_one(".result__a[href]")
+            if not link:
+                continue
+            snippet = block.select_one(".result__snippet")
+            results.append(SearchResult(
+                title=self._clean(link.get_text(" ", strip=True)),
+                url=str(link.get("href") or ""),
+                snippet=self._clean(snippet.get_text(" ", strip=True)) if snippet else "",
+            ))
+        return results
+
     async def search(self, query: str) -> list[SearchResult]:
-        for engine in (self._search_google, self._search_bing):
+        # Google is currently rate-limiting the Railway IP. Prefer Bing/DDG so
+        # browser research remains operational instead of failing the whole job.
+        for engine in (self._search_bing, self._search_duckduckgo, self._search_google):
             try:
                 results = await engine(query)
                 if results:
@@ -182,7 +199,7 @@ class KHLWebResearcher:
             f"{away} КХЛ состав травмы дисквалификация {date}",
             f"{home} КХЛ вероятный вратарь {date}",
             f"{away} КХЛ вероятный вратарь {date}",
-            f"КХЛ таблица 2026 2027 турнирная таблица",
+            "КХЛ таблица 2026 2027 турнирная таблица",
             f"{pair} коэффициенты Winline Фонбет BetBoom Parimatch {date}",
             f"{pair} линия П1 X П2 Winline Фонбет BetBoom Parimatch {date}",
             f"{pair} коэффициенты 1 X 2 Winline Фонбет BetBoom Parimatch {date}",
@@ -234,7 +251,7 @@ class KHLWebResearcher:
                 continue
             for item in results:
                 host = self._host(item.url)
-                if not item.url.startswith("http") or host.endswith("google.com") or host.endswith("bing.com"):
+                if not item.url.startswith("http") or host.endswith("google.com") or host.endswith("bing.com") or host.endswith("duckduckgo.com"):
                     continue
                 if item.url not in unique:
                     unique[item.url] = item
@@ -244,7 +261,6 @@ class KHLWebResearcher:
         other_results = [x for x in all_results if self._source_type(x.url) != "bookmaker"]
         bookmaker_results.sort(key=lambda x: bool(x.snippet), reverse=True)
         other_results.sort(key=lambda x: (self._source_priority(x.url), bool(x.snippet)), reverse=True)
-        # Force bookmaker evidence into the fetched set.
         candidates = (bookmaker_results[:12] + other_results[: max(0, self.MAX_PAGES - min(12, len(bookmaker_results)))])[: self.MAX_PAGES]
 
         pages = await asyncio.gather(*(self._extract_page(item) for item in candidates), return_exceptions=True)
@@ -277,7 +293,7 @@ class KHLWebResearcher:
             "собрано_в_utc": now,
             "матч": f"{home} — {away}",
             "дата_матча": date,
-            "метод": "Google/Bing web search + HTML page extraction",
+            "метод": "Bing/DuckDuckGo/Google browser search + HTML page extraction",
             "запросов": queries,
             "источников_всего": len(sources),
             "источников_линии": sum(1 for x in sources if x.get("тип_источника") == "bookmaker"),
