@@ -6,11 +6,12 @@ from .models import Market, Match, Sport
 from .providers.khl_mobile import KHLMobileClient
 from .providers.sofascore_khl import SofaScoreKHLClient
 from .web_odds import markets_from_web_research
+from .web_odds_search import search_bookmaker_web
 from .web_research import KHLWebResearcher
 
 
 class EnhancedKHLService:
-    """KHL analysis using official KHL data plus broad public web research."""
+    """KHL analysis using official KHL data plus public web research."""
 
     def __init__(self) -> None:
         self.khl_mobile = KHLMobileClient()
@@ -55,35 +56,48 @@ class EnhancedKHLService:
         game: dict[str, Any] | None = None,
         analysis_data: dict[str, Any] | None = None,
     ) -> tuple[Market, ...]:
-        # Bookmaker odds are collected from public web research first.
+        # 1) Use research already collected for the match.
         if analysis_data:
             web_context = analysis_data.get("веб_исследование") or {}
             markets, meta = markets_from_web_research(web_context)
             analysis_data["веб_линии"] = meta
             if markets:
                 analysis_data["режим_линии"] = "web bookmaker research"
-                print(
-                    f"KHL web odds: found {len(markets)} markets from {meta.get('основной_источник', {}).get('домен', 'web')}",
-                    flush=True,
-                )
+                print(f"KHL web odds: found {len(markets)} markets", flush=True)
                 return markets
 
-        # SofaScore remains only an optional public-data fallback for odds.
-        try:
-            reserve_game = None
-            if game and game.get("__sofascore"):
-                reserve_game = game
-            elif game:
-                reserve_game = await self._find_sofascore_match(game)
-            if reserve_game and reserve_game.get("id") is not None:
-                markets = await self.sofascore.markets_for_event(int(reserve_game["id"]))
-                if markets:
+        # 2) Dedicated search for the four requested bookmakers.
+        if game:
+            teams = game.get("teams") or {}
+            home = str((teams.get("home") or {}).get("name") or "")
+            away = str((teams.get("away") or {}).get("name") or "")
+            date = str(game.get("date") or game.get("datetime") or "")[:10]
+            try:
+                odds, bookmakers = await search_bookmaker_web(home, away, date)
+                if odds:
+                    markets = tuple(Market(name, odd, 1 / odd) for name, odd in odds.items())
                     if analysis_data is not None:
-                        analysis_data["режим_линии"] = "SofaScore fallback"
+                        analysis_data["режим_линии"] = "dedicated bookmaker web search"
+                        analysis_data["веб_линии"] = {
+                            "статус": "найдено",
+                            "разрешенные_БК": ["Winline", "Фонбет", "BetBoom", "Parimatch"],
+                            "источники_линии": {
+                                name: {"БК": bookmakers.get(name, ""), "тип": "web comparison"}
+                                for name in odds
+                            },
+                        }
+                    print(
+                        "KHL dedicated bookmaker odds: "
+                        + ", ".join(f"{name}={odd} ({bookmakers.get(name, '')})" for name, odd in odds.items()),
+                        flush=True,
+                    )
                     return markets
-        except Exception as exc:
-            print(f"SofaScore KHL odds fallback failed: {type(exc).__name__}: {exc}", flush=True)
-        print("KHL odds: no confirmed bookmaker line found on public web", flush=True)
+            except Exception as exc:
+                print(f"KHL dedicated bookmaker odds failed: {type(exc).__name__}: {exc}", flush=True)
+
+        # No other odds source is accepted. In particular, do not use SofaScore
+        # or an unnamed aggregator as a bookmaker line.
+        print("KHL odds: no confirmed Winline/Fonbet/BetBoom/Parimatch line found", flush=True)
         return ()
 
     async def _web_context(self, home: str, away: str, start: str) -> dict[str, Any]:
@@ -114,9 +128,9 @@ class EnhancedKHLService:
             "Для свежих кадровых новостей приоритет официальному клубу/KHL.ru; дата публикации обязательна для оценки свежести."
         )
         context["правило_коэффициентов"] = (
-            "Использовать только коэффициенты, найденные на разрешённых публичных букмекерских страницах или "
-            "агрегаторах с явным временем/датой обновления. Случайное число из сниппета не считать линией. "
-            "При отсутствии подтверждения линия не создаётся и ИИ не имеет права её выдумывать."
+            "Использовать только текущие коэффициенты Winline, Фонбет, BetBoom или Parimatch, "
+            "полученные с их публичных страниц либо из страницы сравнения, где строка явно подписана названием БК. "
+            "Не использовать SofaScore, API-SPORT, неидентифицированные агрегаторы или выдуманные значения."
         )
         context["статистика_для_ии"] = {
             "базовые_данные": context.get("статистика_для_ии", context.copy()),
@@ -143,8 +157,6 @@ class EnhancedKHLService:
             context["резервный_источник"] = "web research"
             return self._merge_web_context(context, web_context)
 
-        # A game should normally come from the KHL Mobile schedule. If a
-        # manually supplied game reaches analysis, use KHL Mobile directly.
         try:
             context = await self.khl_mobile.build_match_context(home, away, start)
             context["активный_источник_статистики"] = "Официальный KHL Mobile API + web research"
