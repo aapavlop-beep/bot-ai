@@ -33,7 +33,6 @@ def _odds(value: str) -> float | None:
 def _triplets(text: str) -> list[tuple[float, float, float]]:
     text = _normalize(text)
     values: list[float] = []
-    # Decimal odds are normally shown with a comma or dot.
     for raw in re.findall(r"(?<!\d)(?:1[.,]\d{1,3}|[2-9][.,]\d{1,3}|1\d[.,]\d{1,3}|20[.,]\d{1,3})(?!\d)", text):
         odd = _odds(raw)
         if odd is not None:
@@ -68,32 +67,14 @@ def _bookmaker_from_host(url: str) -> str | None:
     return None
 
 
-def _bookmaker_from_text(text: str) -> str | None:
-    low = _normalize(text).lower()
-    patterns = {
-        "Winline": ("winline", "винлайн"),
-        "Fonbet": ("fonbet", "фонбет", "fon.bet"),
-        "BetBoom": ("betboom", "бетбум"),
-        "Parimatch": ("parimatch", "пари матч"),
-    }
-    for bookmaker, names in patterns.items():
-        if any(name in low for name in names):
-            return bookmaker
-    return None
-
-
-def _parse_evidence(text: str, home: str, away: str, bookmaker: str | None = None) -> tuple[float, float, float] | None:
+def _parse_evidence(text: str, home: str, away: str, bookmaker: str) -> tuple[float, float, float] | None:
     text = _normalize(text)
     if not _contains_team(text, home) or not _contains_team(text, away):
         return None
-    bookmaker = bookmaker or _bookmaker_from_text(text)
-    if not bookmaker:
-        return None
     marker = re.search(r"winline|винлайн|fonbet|фонбет|fon\.bet|betboom|бетбум|parimatch|пари матч", text, re.I)
-    windows = []
+    windows = [text]
     if marker:
-        windows.append(text[max(0, marker.start() - 1200): min(len(text), marker.end() + 2500)])
-    windows.append(text)
+        windows.insert(0, text[max(0, marker.start() - 1200): min(len(text), marker.end() + 2500)])
     for window in windows:
         trips = _triplets(window)
         if trips:
@@ -104,8 +85,9 @@ def _parse_evidence(text: str, home: str, away: str, bookmaker: str | None = Non
 async def search_bookmaker_web(home: str, away: str, date: str) -> tuple[dict[str, float], dict[str, str]]:
     """Find 1X2 odds using real Chromium browser search only.
 
-    The function does not call API-Sport, SofaScore, The Odds API or bookmaker
-    APIs. It searches the public web in Chromium and opens returned public pages.
+    A line is accepted only when the opened page itself belongs to Winline,
+    Fonbet, BetBoom or Parimatch. Aggregators are never treated as bookmaker
+    confirmation.
     """
     researcher = KHLWebResearcher()
     date_ru = f"{date[8:10]}.{date[5:7]}.{date[:4]}" if len(date) >= 10 else date
@@ -122,9 +104,8 @@ async def search_bookmaker_web(home: str, away: str, date: str) -> tuple[dict[st
     try:
         for query in queries:
             results = await researcher.search(query)
-            # First use snippets from search results, then open only bookmaker pages.
             for result in results:
-                bookmaker = _bookmaker_from_host(result.url) or _bookmaker_from_text(result.title + " " + result.snippet)
+                bookmaker = _bookmaker_from_host(result.url)
                 if not bookmaker:
                     continue
                 evidence = _parse_evidence(result.title + " " + result.snippet, home, away, bookmaker)
