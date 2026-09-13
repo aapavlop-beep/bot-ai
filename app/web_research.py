@@ -5,7 +5,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from urllib.parse import quote_plus, urljoin, urlparse
+from urllib.parse import quote_plus, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -17,21 +17,34 @@ class SearchResult:
     url: str
     snippet: str
     text: str = ""
+    published_at: str = ""
 
 
 class KHLWebResearcher:
-    """Browser-style web research without a sports-data API.
+    """Build a source-attributed KHL research dossier from public web pages.
 
-    Searches public web pages, follows relevant results, extracts readable text,
-    and returns source-attributed evidence for the AI analyst. It deliberately
-    does not invent missing facts or bookmaker odds.
+    Search is deliberately independent from sports APIs. The collector does not
+    invent injuries, lineups, goalies or odds: every claim remains tied to a
+    source page/snippet and publication date when the page exposes one.
     """
 
-    CACHE_TTL = 20 * 60
-    MAX_RESULTS_PER_QUERY = 3
-    MAX_PAGES = 14
-    MAX_TEXT_PER_PAGE = 4500
-    REQUEST_TIMEOUT = 12.0
+    CACHE_TTL = 30 * 60
+    MAX_RESULTS_PER_QUERY = 4
+    MAX_PAGES = 24
+    MAX_TEXT_PER_PAGE = 6500
+    REQUEST_TIMEOUT = 15.0
+
+    OFFICIAL = {
+        "khl.ru", "fhr.ru",
+    }
+    SPORTS_MEDIA = {
+        "sports.ru", "championat.com", "matchtv.ru", "allhockey.ru",
+        "sport-express.ru", "metaratings.ru", "rsport.ria.ru",
+    }
+    BOOKMAKER_HINTS = {
+        "fon.bet", "fonbet.ru", "betboom.ru", "betcity.ru", "olimp.bet",
+        "ligastavok.ru", "winline.ru", "bettery.ru",
+    }
 
     def __init__(self) -> None:
         self._cache: dict[str, tuple[float, dict]] = {}
@@ -53,9 +66,41 @@ class KHLWebResearcher:
         return re.sub(r"\s+", " ", value or "").strip()
 
     @staticmethod
-    def _same_domain(url: str, allowed: set[str]) -> bool:
-        host = urlparse(url).netloc.lower().removeprefix("www.")
-        return host in allowed or any(host.endswith("." + d) for d in allowed)
+    def _host(url: str) -> str:
+        return urlparse(url).netloc.lower().removeprefix("www.")
+
+    @classmethod
+    def _source_type(cls, url: str) -> str:
+        host = cls._host(url)
+        if host in cls.OFFICIAL or any(host.endswith("." + d) for d in cls.OFFICIAL):
+            return "official"
+        if host in cls.SPORTS_MEDIA or any(host.endswith("." + d) for d in cls.SPORTS_MEDIA):
+            return "sports_media"
+        if host in cls.BOOKMAKER_HINTS or any(host.endswith("." + d) for d in cls.BOOKMAKER_HINTS):
+            return "bookmaker"
+        return "other"
+
+    @classmethod
+    def _source_priority(cls, url: str) -> int:
+        return {"official": 4, "sports_media": 3, "bookmaker": 2, "other": 1}[cls._source_type(url)]
+
+    @staticmethod
+    def _extract_published_at(soup: BeautifulSoup) -> str:
+        selectors = [
+            ("meta", {"property": "article:published_time"}),
+            ("meta", {"property": "og:article:published_time"}),
+            ("meta", {"name": "date"}),
+            ("meta", {"name": "pubdate"}),
+            ("meta", {"itemprop": "datePublished"}),
+        ]
+        for tag, attrs in selectors:
+            node = soup.find(tag, attrs=attrs)
+            if node and node.get("content"):
+                return str(node.get("content")).strip()
+        node = soup.find("time")
+        if node:
+            return str(node.get("datetime") or node.get_text(" ", strip=True) or "").strip()
+        return ""
 
     async def _search_google(self, query: str) -> list[SearchResult]:
         url = "https://www.google.com/search?q=" + quote_plus(query) + "&hl=ru&num=10"
@@ -68,7 +113,7 @@ class KHLWebResearcher:
             title_node = block.select_one("h3")
             if not link or not title_node:
                 continue
-            href = link.get("href") or ""
+            href = str(link.get("href") or "")
             if href.startswith("/url?q="):
                 href = href.split("/url?q=", 1)[1].split("&", 1)[0]
             if not href.startswith("http"):
@@ -117,13 +162,14 @@ class KHLWebResearcher:
             if "text/html" not in content_type:
                 return result
             soup = BeautifulSoup(response.text, "html.parser")
+            published_at = self._extract_published_at(soup)
             for node in soup.select("script,style,noscript,svg,nav,footer,header,form"):
                 node.decompose()
             root = soup.select_one("article") or soup.select_one("main") or soup.body
             if root is None:
-                return result
+                return SearchResult(result.title, result.url, result.snippet, "", published_at)
             text = self._clean(root.get_text(" ", strip=True))
-            return SearchResult(result.title, result.url, result.snippet, text[: self.MAX_TEXT_PER_PAGE])
+            return SearchResult(result.title, result.url, result.snippet, text[: self.MAX_TEXT_PER_PAGE], published_at)
         except Exception as exc:
             print(f"KHL web page failed: {result.url}: {type(exc).__name__}: {exc}", flush=True)
             return result
@@ -133,17 +179,44 @@ class KHLWebResearcher:
         pair = f'"{home}" "{away}" КХЛ'
         return [
             f"{pair} {date} состав травмы дисквалификация",
-            f"{pair} последние матчи форма результаты",
+            f"{pair} {date} стартовый состав вратарь",
+            f"{pair} последние 5 матчей результаты форма",
+            f"{pair} последние 10 матчей результаты статистика",
             f"{pair} очные встречи H2H",
-            f"{home} КХЛ последние матчи состав травмы {date}",
-            f"{away} КХЛ последние матчи состав травмы {date}",
-            f"{home} {away} КХЛ вратарь состав перед матчем {date}",
+            f"{home} КХЛ состав травмы дисквалификация {date}",
+            f"{away} КХЛ состав травмы дисквалификация {date}",
+            f"{home} КХЛ вероятный вратарь {date}",
+            f"{away} КХЛ вероятный вратарь {date}",
             f"КХЛ таблица 2026 2027 турнирная таблица",
             f"{pair} коэффициенты букмекеров {date}",
+            f"{pair} линия П1 X П2 {date}",
             f"site:khl.ru {home} {away} {date}",
             f"site:khl.ru {home} травма состав {date}",
             f"site:khl.ru {away} травма состав {date}",
+            f"site:khl.ru {home} {away} вратарь {date}",
         ]
+
+    @staticmethod
+    def _bucket(text: str) -> list[str]:
+        low = text.lower()
+        buckets: list[str] = []
+        patterns = {
+            "match": ("матч", "начало", "расписан", "сегодня", "завтра"),
+            "lineups": ("состав", "звено", "заявк", "линия"),
+            "injuries": ("травм", "поврежд", "не сыгра", "больн", "в лазарете"),
+            "suspensions": ("дисквалифик", "штраф", "дисциплинар"),
+            "goalies": ("вратар", "голкипер", "стартов", "ворота"),
+            "form": ("последн", "побед", "пораж", "серия", "результат"),
+            "h2h": ("личн", "очная", "h2h", "встреч"),
+            "standings": ("таблиц", "место", "очки", "турнирн"),
+            "travel": ("перелет", "перелёт", "выезд", "дорог", "часов"),
+            "odds": ("коэффициент", "кф", "ставк", "линия", "п1", "п2"),
+            "news": ("новост", "интервью", "тренер", "пресс-конференц"),
+        }
+        for bucket, words in patterns.items():
+            if any(word in low for word in words):
+                buckets.append(bucket)
+        return buckets or ["other"]
 
     async def research_match(self, home: str, away: str, date: str) -> dict:
         key = f"{home}|{away}|{date}".lower()
@@ -158,35 +231,68 @@ class KHLWebResearcher:
             if not isinstance(results, list):
                 continue
             for item in results:
-                host = urlparse(item.url).netloc.lower()
+                host = self._host(item.url)
                 if not item.url.startswith("http") or host.endswith("google.com") or host.endswith("bing.com"):
                     continue
-                unique.setdefault(item.url, item)
+                # Prefer official and established sports sources when the same
+                # story is indexed more than once.
+                previous = unique.get(item.url)
+                if previous is None:
+                    unique[item.url] = item
 
-        selected = list(unique.values())[: self.MAX_PAGES]
-        pages = await asyncio.gather(*(self._extract_page(item) for item in selected), return_exceptions=True)
+        candidates = sorted(
+            unique.values(),
+            key=lambda x: (self._source_priority(x.url), bool(x.snippet)),
+            reverse=True,
+        )[: self.MAX_PAGES]
+        pages = await asyncio.gather(*(self._extract_page(item) for item in candidates), return_exceptions=True)
+
         sources: list[dict] = []
         for page in pages:
             if not isinstance(page, SearchResult):
                 continue
+            text = page.text or page.snippet
+            if not text:
+                continue
             sources.append({
                 "заголовок": page.title,
                 "url": page.url,
-                "домен": urlparse(page.url).netloc,
+                "домен": self._host(page.url),
+                "тип_источника": self._source_type(page.url),
+                "приоритет": self._source_priority(page.url),
+                "дата_публикации": page.published_at,
+                "категории": self._bucket(page.title + " " + text),
                 "сниппет": page.snippet,
-                "текст": page.text,
+                "текст": text,
             })
 
+        categories: dict[str, list[dict]] = {}
+        for source in sources:
+            for category in source["категории"]:
+                categories.setdefault(category, []).append(source)
+
+        # Keep the AI prompt manageable: each category gets its best few sources,
+        # while the full source list is still preserved for diagnostics.
+        evidence = {
+            category: items[:4]
+            for category, items in categories.items()
+        }
         now = datetime.now(timezone.utc).isoformat()
         result = {
             "собрано_в_utc": now,
-            "метод": "web search + page extraction",
+            "матч": f"{home} — {away}",
+            "дата_матча": date,
+            "метод": "Google/Bing web search + HTML page extraction",
             "запросов": queries,
+            "источников_всего": len(sources),
             "источников": sources,
+            "структурированные_доказательства": evidence,
             "правило_достоверности": (
-                "Факт считается подтверждённым только при наличии текста/сниппета источника. "
-                "Отсутствующие сведения нельзя додумывать. Для травм, составов и коэффициентов "
-                "приоритет имеют свежие официальные источники; старые страницы используются только как контекст."
+                "Факт считается подтверждённым только при наличии текста или сниппета источника. "
+                "Не считать отсутствие игрока травмой без явного подтверждения. "
+                "Для кадровых новостей и коэффициентов учитывать свежесть и источник. "
+                "Коэффициент из поисковой выдачи является кандидатом, а не подтверждённой линией. "
+                "При конфликте источников приоритет: официальный KHL/клуб, затем крупное спортивное СМИ, затем прочие источники."
             ),
         }
         self._cache[key] = (time.time(), result)
