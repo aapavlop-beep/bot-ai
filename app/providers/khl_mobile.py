@@ -39,12 +39,13 @@ class KHLMobileClient:
                     timeout=self.timeout,
                     follow_redirects=True,
                     trust_env=False,
+                    headers={"User-Agent": "KHL/4.11.2 (Android; Android 14; Scale/1.00)", "Accept-Language": "ru-RU,ru;q=0.9"},
                 ) as client:
                     response = await client.get(f"{self.BASE_URL}/{path.lstrip('/')}", params=params)
                     response.raise_for_status()
                     payload = response.json()
                     if ttl > 0:
-                        self._cache[key] = (now, payload)
+                        self._cache[key] = (time.monotonic(), payload)
                     return payload
             except Exception as exc:
                 last_error = exc
@@ -94,17 +95,15 @@ class KHLMobileClient:
         start: datetime,
         end: datetime,
     ) -> list[dict[str, Any]]:
-        """Query the current stage first, then retry without stage filtering.
-
-        The mobile API can keep an outdated current_stage_id while its events
-        endpoint already contains the new season. In that case stage filtering
-        silently returns an empty history.
-        """
-        games = await self.events(stage_id=stage_id, team_id=team_id, start=start, end=end)
-        if len(games) >= 3 or stage_id is None:
-            return games
-        fallback = await self.events(stage_id=None, team_id=team_id, start=start, end=end)
-        return fallback if len(fallback) > len(games) else games
+        """Use stage filtering when valid, but never let a stale stage break history."""
+        if stage_id is not None:
+            try:
+                games = await self.events(stage_id=stage_id, team_id=team_id, start=start, end=end)
+                if len(games) >= 3:
+                    return games
+            except Exception as exc:
+                print(f"KHL mobile stage {stage_id} events failed: {type(exc).__name__}: {exc}; retrying without stage", flush=True)
+        return await self.events(stage_id=None, team_id=team_id, start=start, end=end)
 
     async def event(self, event_id: int) -> dict[str, Any]:
         payload = await self._get("event_v2.json", {"id": event_id}, ttl=30)
@@ -116,7 +115,13 @@ class KHLMobileClient:
         params: dict[str, Any] = {"id": team_id}
         if stage_id is not None:
             params["stage_id"] = stage_id
-        payload = await self._get("team_v2.json", params, ttl=300)
+        try:
+            payload = await self._get("team_v2.json", params, ttl=300)
+        except Exception as exc:
+            if stage_id is None:
+                raise
+            print(f"KHL mobile team {team_id} stage {stage_id} failed: {type(exc).__name__}: {exc}; retrying without stage", flush=True)
+            payload = await self._get("team_v2.json", {"id": team_id}, ttl=300)
         if isinstance(payload, dict) and isinstance(payload.get("team"), dict):
             return payload["team"]
         return payload if isinstance(payload, dict) else {}
@@ -168,6 +173,19 @@ class KHLMobileClient:
             return int(match.group(1)), int(match.group(2))
         return None, None
 
+    @staticmethod
+    def _event_datetime(event: dict[str, Any]) -> datetime | None:
+        value = event.get("start_at")
+        if value in (None, ""):
+            return None
+        try:
+            timestamp = float(value)
+            if timestamp > 100_000_000_000:
+                timestamp /= 1000.0
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+
     @classmethod
     def compact_event(cls, event: dict[str, Any], team_id: int | None = None) -> dict[str, Any]:
         a = event.get("team_a") or {}
@@ -184,9 +202,10 @@ class KHLMobileClient:
             result = "поражение"
         else:
             result = "ничья"
+        event_dt = cls._event_datetime(event)
         return {
             "id": event.get("id"),
-            "дата": datetime.fromtimestamp(event.get("start_at", 0), tz=timezone.utc).strftime("%Y-%m-%d") if event.get("start_at") else "",
+            "дата": event_dt.strftime("%Y-%m-%d") if event_dt else "",
             "хозяева": a.get("name"),
             "гости": b.get("name"),
             "счёт": event.get("score") or "",
@@ -292,12 +311,21 @@ class KHLMobileClient:
         pair_stat: dict[str, Any] = {}
         match_event = None
         if home_id is not None and away_id is not None:
-            upcoming = await self.events(
-                stage_id=stage_id,
-                team_id=home_id,
-                start=start_dt - timedelta(hours=12),
-                end=start_dt + timedelta(hours=12),
-            )
+            try:
+                upcoming = await self.events(
+                    stage_id=stage_id,
+                    team_id=home_id,
+                    start=start_dt - timedelta(hours=12),
+                    end=start_dt + timedelta(hours=12),
+                )
+            except Exception as exc:
+                print(f"KHL mobile upcoming with stage failed: {type(exc).__name__}: {exc}; retrying without stage", flush=True)
+                upcoming = await self.events(
+                    stage_id=None,
+                    team_id=home_id,
+                    start=start_dt - timedelta(hours=12),
+                    end=start_dt + timedelta(hours=12),
+                )
             if len(upcoming) < 1 and stage_id is not None:
                 upcoming = await self.events(
                     stage_id=None,
