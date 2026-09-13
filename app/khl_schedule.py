@@ -71,13 +71,7 @@ def _build_game(date_value: str, time_value: str, raw_home: str, raw_away: str) 
 
 
 def _extract_fixtures(text: str, date_value: str) -> list[dict[str, Any]]:
-    """Extract fixtures from public calendar/search HTML.
-
-    Championat duplicates date/time columns and represents an empty score as
-    "– : –". The old parser only accepted ASCII hyphens, which caused a valid
-    browser result to become zero games. Keep the parser deliberately strict
-    about team names but tolerant about dash/score formatting.
-    """
+    """Extract fixtures from public calendar/search HTML."""
     text = _normalize_text(text).replace("−", "—").replace("–", "—")
     date_full = datetime.fromisoformat(date_value).strftime("%d.%m.%Y")
     date_short = datetime.fromisoformat(date_value).strftime("%d.%m")
@@ -132,7 +126,6 @@ async def _web_games_for_date(date_value: str) -> list[dict[str, Any]]:
         "https://www.championat.com/hockey/_superleague.html",
     ]
 
-    # First use real public calendar pages, not sports APIs.
     for url in direct_urls:
         for game in await _extract_direct_calendar(researcher, url, date_value):
             if not any(x["id"] == game["id"] for x in games):
@@ -140,12 +133,11 @@ async def _web_games_for_date(date_value: str) -> list[dict[str, Any]]:
         if len(games) >= 4:
             break
 
-    # Search snippets are a second browser-only fallback. This also works when
-    # the calendar HTML is blocked by a hosting provider.
+    date_full = datetime.fromisoformat(date_value).strftime("%d.%m.%Y")
     for query in (
-        f'КХЛ {date_value} расписание матчи',
-        f'"{datetime.fromisoformat(date_value).strftime("%d.%m.%Y")}" КХЛ матчи',
-        f'site:championat.com/hockey {_normalize_text(date_value)} КХЛ расписание',
+        f"КХЛ {date_value} расписание матчи",
+        f'"{date_full}" КХЛ матчи',
+        f"site:championat.com/hockey {date_value} КХЛ расписание",
     ):
         try:
             results = await researcher.search(query)
