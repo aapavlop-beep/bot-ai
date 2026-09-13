@@ -62,9 +62,6 @@ def _extract_fixtures(text: str, date_value: str) -> list[dict[str, Any]]:
     year = datetime.fromisoformat(date_value).year
     date_full = datetime.fromisoformat(date_value).strftime("%d.%m.%Y")
     date_short = datetime.fromisoformat(date_value).strftime("%d.%m")
-
-    # Typical browser-search text from Championat and similar pages:
-    # 13.09.2026 13:30 13.09.2026 13:30 Сибирь — Автомобилист | – : – |
     patterns = [
         re.compile(
             rf"{re.escape(date_full)}\s+(?:{re.escape(date_full)}\s+)?(\d{{1,2}}:\d{{2}})\s+(.{{2,60}}?)\s+—\s+(.{{2,60}}?)(?=\s*\||\s*-\s*:\s*-|\s+КХЛ|\s+регуляр|$)",
@@ -79,7 +76,6 @@ def _extract_fixtures(text: str, date_value: str) -> list[dict[str, Any]]:
             re.I,
         ),
     ]
-
     found: list[dict[str, Any]] = []
     for pattern in patterns:
         for match in pattern.finditer(text):
@@ -106,15 +102,26 @@ def _extract_fixtures(text: str, date_value: str) -> list[dict[str, Any]]:
 
 async def _web_games_for_date(date_value: str) -> list[dict[str, Any]]:
     researcher = KHLWebResearcher()
+    unique: dict[str, SearchResult] = {}
+
+    # Direct browser-page seeds. These are normal public webpages, not sports
+    # APIs, and they prevent a temporary Google/Bing rate-limit from making the
+    # daily schedule empty.
+    direct_urls = [
+        "https://www.championat.com/hockey/_superleague/tournament/7092/calendar/",
+        "https://www.championat.com/hockey/_superleague.html",
+        f"https://x2sport.ru/calendar?from={date_value}",
+    ]
+    for url in direct_urls:
+        unique[url] = SearchResult("KHL browser schedule", url, "")
+
+    # Search is supplemental: if a search engine is available it can discover
+    # newer calendar pages or another schedule source. A 429 is non-fatal.
     queries = [
         f'КХЛ {date_value} расписание матчи',
         f'КХЛ {date_value} календарь игр',
-        f'КХЛ {date_value} результаты расписание кто играет',
-        f'"КХЛ" "{datetime.fromisoformat(date_value).strftime("%d.%m.%Y")}" матчи',
         f'site:championat.com/hockey/_superleague {date_value} КХЛ расписание',
-        f'site:khl.ru {date_value} КХЛ матчи',
     ]
-    unique: dict[str, SearchResult] = {}
     for query in queries:
         try:
             results = await researcher.search(query)
@@ -127,22 +134,20 @@ async def _web_games_for_date(date_value: str) -> list[dict[str, Any]]:
 
     results = list(unique.values())
     results.sort(key=lambda r: (
+        2 if "championat.com/hockey/_superleague/tournament/7092/calendar" in r.url else
         1 if "championat.com" in r.url else 0,
-        1 if "khl.ru" in r.url else 0,
         1 if "x2sport.ru" in r.url else 0,
     ), reverse=True)
 
     games: list[dict[str, Any]] = []
-    for result in results[:12]:
-        # Parse the search snippet first: it often contains the complete
-        # schedule even when the destination page blocks automated fetching.
+    for result in results[:15]:
         texts = [result.snippet]
         try:
             page = await researcher._extract_page(result)
             if page.text:
                 texts.insert(0, page.text)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"KHL schedule page failed: {result.url}: {type(exc).__name__}", flush=True)
         for text in texts:
             for game in _extract_fixtures(_normalize_text(text), date_value):
                 if not any(x["id"] == game["id"] for x in games):
