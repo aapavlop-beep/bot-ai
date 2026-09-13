@@ -42,18 +42,32 @@ def _normalize(text: str) -> str:
 
 
 def _parse_rows(text: str) -> list[tuple[str, tuple[float, float, float]]]:
+    """Parse explicitly labelled bookmaker rows from any public web page.
+
+    The page itself must identify the bookmaker next to the three 1X2 odds.
+    We never accept an unlabeled three-number sequence as a bookmaker quote.
+    """
     text = _normalize(text)
     name = r"(?:Winline|Винлайн|Fonbet|Фонбет|BetBoom|БетБум|Parimatch|PARI|Pari)"
     num = r"([0-9]+[.,][0-9]+)"
     sep = r"(?:\s*[|;/]\s*|\s+)"
-    pattern = rf"(?P<book>{name}){sep}{num}{sep}{num}{sep}{num}(?!\d)"
+    patterns = [
+        rf"(?P<book>{name}){sep}{num}{sep}{num}{sep}{num}(?!\d)",
+        rf"{num}{sep}{num}{sep}{num}{sep}(?P<book>{name})(?!\w)",
+    ]
     result: list[tuple[str, tuple[float, float, float]]] = []
-    for m in re.finditer(pattern, text, flags=re.IGNORECASE):
-        key = m.group("book").lower().replace("ё", "е")
-        book = BOOKMAKERS.get(key)
-        values = tuple(_odds(m.group(i)) for i in (2, 3, 4))
-        if book and all(v is not None for v in values):
-            result.append((book, values))  # type: ignore[arg-type]
+    for pattern in patterns:
+        for m in re.finditer(pattern, text, flags=re.IGNORECASE):
+            key = m.group("book").lower().replace("ё", "е")
+            book = BOOKMAKERS.get(key)
+            if not book:
+                continue
+            number_groups = [i for i in range(1, 5) if i != m.re.groupindex.get("book")]
+            # The named group is always called 'book'; collect all numeric groups directly.
+            nums = [g for g in m.groups() if g and g != m.group("book")]
+            values = tuple(_odds(g) for g in nums[:3])
+            if len(values) == 3 and all(v is not None for v in values):
+                result.append((book, values))  # type: ignore[arg-type]
     return result
 
 
@@ -96,11 +110,11 @@ def _add_best(markets: dict[str, float], sources: dict[str, str], values: tuple[
 
 
 async def search_bookmaker_web(home: str, away: str, date: str) -> tuple[dict[str, float], dict[str, str]]:
-    """Find current 1X2 odds using browser-style public web search only.
+    """Find current 1X2 odds using public browser-style web research only.
 
-    No bookmaker API is called. Direct bookmaker pages are preferred; when a
-    bookmaker blocks automated access, an approved comparison page is accepted
-    only when it explicitly labels the row with Winline/Fonbet/BetBoom/Parimatch.
+    Direct bookmaker pages are preferred. If they block automated access, a
+    public comparison/article page is accepted only when it explicitly labels
+    Winline/Fonbet/BetBoom/Parimatch next to the odds. No bookmaker API is used.
     """
     queries = [
         f'"{home}" "{away}" {date} Winline',
@@ -108,7 +122,8 @@ async def search_bookmaker_web(home: str, away: str, date: str) -> tuple[dict[st
         f'"{home}" "{away}" {date} BetBoom',
         f'"{home}" "{away}" {date} Parimatch',
         f'"{home}" "{away}" {date} Winline Fonbet BetBoom Parimatch',
-        f'site:prognozai.ru "{home}" "{away}" {date}',
+        f'site:prognozai.ru/matches/hockey "{home}" "{away}" {date} коэффициенты',
+        f'site:prognozai.ru "{home}" "{away}" {date} Winline Fonbet BetBoom Parimatch',
     ]
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/139 Safari/537.36",
@@ -157,30 +172,32 @@ async def search_bookmaker_web(home: str, away: str, date: str) -> tuple[dict[st
                         host = _host(url)
                         is_direct = host in TARGET_BOOKMAKER_DOMAINS
                         is_comparison = host in ALLOWED_COMPARISON
-                        if not (is_direct or is_comparison):
-                            continue
 
-                        # Search snippets can contain the complete bookmaker row,
-                        # so parse them before requesting the page.
-                        text = snippet
-                        if is_direct:
-                            bookmaker = next((name for key, name in BOOKMAKERS.items() if key in host), "")
-                            values = _parse_1x2(text)
-                            if values and bookmaker:
-                                _add_best(markets, sources, values, bookmaker)
+                        # Search snippets may already contain an explicitly labelled
+                        # bookmaker row. Parse it regardless of the host.
+                        for bookmaker, values in _parse_rows(snippet):
+                            _add_best(markets, sources, values, bookmaker)
+
+                        # Do not trust an unlabeled aggregator line. We only open
+                        # arbitrary search results to look for explicit bookmaker labels.
+                        if not (is_direct or is_comparison) and not any(
+                            name.lower() in snippet.lower() for name in ("winline", "винлайн", "fonbet", "фонбет", "betboom", "бетбум", "parimatch", "pari")
+                        ):
+                            continue
 
                         try:
                             page = await client.get(url)
                             page.raise_for_status()
                             page_soup = BeautifulSoup(page.text, "html.parser")
                             page_text = _normalize(page_soup.get_text(" ", strip=True))
-                        except Exception:
+                        except Exception as exc:
+                            print(f"KHL bookmaker page skipped: {host}: {type(exc).__name__}", flush=True)
                             continue
 
-                        if is_comparison:
-                            for bookmaker, values in _parse_rows(page_text):
-                                _add_best(markets, sources, values, bookmaker)
-                        elif is_direct:
+                        for bookmaker, values in _parse_rows(page_text):
+                            _add_best(markets, sources, values, bookmaker)
+
+                        if is_direct:
                             bookmaker = next((name for key, name in BOOKMAKERS.items() if key in host), "")
                             values = _parse_1x2(page_text)
                             if values and bookmaker:
@@ -192,8 +209,12 @@ async def search_bookmaker_web(home: str, away: str, date: str) -> tuple[dict[st
                                         markets[market] = odd
                                         sources[market] = bookmaker
 
-                    # Do not hammer search engines once we have a complete 1X2 line.
                     if all(key in markets for key in ("П1", "X", "П2")):
+                        print(
+                            "KHL browser bookmaker odds confirmed: "
+                            + ", ".join(f"{k}={markets[k]} ({sources.get(k, '')})" for k in ("П1", "X", "П2")),
+                            flush=True,
+                        )
                         return markets, sources
                 except Exception as exc:
                     print(f"KHL dedicated bookmaker web search failed: {type(exc).__name__}: {exc}", flush=True)
