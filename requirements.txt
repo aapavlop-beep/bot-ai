@@ -3,6 +3,6 @@ fastapi>=0.115,<1
 uvicorn[standard]>=0.34,<1
 pydantic-settings>=2.8,<3
 httpx>=0.28,<1
-aiohttp>=3.11,<4
 openai>=3.8,<4
 beautifulsoup4>=4.13,<5
+playwright>=1.55,<2
