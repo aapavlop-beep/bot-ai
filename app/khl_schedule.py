@@ -11,6 +11,22 @@ from .providers.sofascore_khl import SofaScoreKHLClient
 from .team_names import display_team_name
 
 
+def _mobile_event_date(event: dict[str, Any], fallback: str) -> str:
+    """Normalize KHL mobile timestamps without assuming seconds vs milliseconds."""
+    value = event.get("start_at")
+    if value in (None, ""):
+        return fallback
+    try:
+        timestamp = float(value)
+        # KHL mobile API normally uses Unix seconds, but some responses may
+        # contain milliseconds. Convert only when the value is clearly ms.
+        if timestamp > 100_000_000_000:
+            timestamp /= 1000.0
+        return datetime.fromtimestamp(timestamp, tz=ZoneInfo("Europe/Moscow")).date().isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return fallback
+
+
 async def _mobile_today_games(today: str) -> list[dict[str, Any]]:
     client = KHLMobileClient()
     start = datetime.fromisoformat(today).replace(tzinfo=ZoneInfo("Europe/Moscow"))
@@ -23,8 +39,11 @@ async def _mobile_today_games(today: str) -> list[dict[str, Any]]:
         event_id = event.get("id")
         if event_id is None or not a.get("name") or not b.get("name"):
             continue
-        start_at = event.get("start_at")
-        date_value = datetime.fromtimestamp(int(start_at), tz=ZoneInfo("Europe/Moscow")).isoformat() if start_at else today
+        date_value = _mobile_event_date(event, today)
+        # The API query already restricts the window to this Moscow day. Keep
+        # malformed timestamps from killing the reserve source.
+        if date_value != today:
+            continue
         result.append({
             "id": int(event_id),
             "date": date_value,
@@ -69,52 +88,27 @@ async def verified_today_games(client: ApiSportRuClient) -> list[dict[str, Any]]
         if result:
             print(f"KHL schedule source: OFFICIAL KHL MOBILE API RESERVE ({len(result)} games)", flush=True)
             return result
-        print("Official KHL mobile API returned no games; trying HockeyTech reserve", flush=True)
+        print("Official KHL mobile API returned no games; trying SofaScore last", flush=True)
     except Exception as exc:
-        print(f"Official KHL mobile API failed: {type(exc).__name__}: {exc}; trying HockeyTech reserve", flush=True)
+        print(f"Official KHL mobile API failed: {type(exc).__name__}: {exc}; trying SofaScore last", flush=True)
 
+    # HockeyTech is intentionally disabled in this project, so do not spend a
+    # request on a provider that can only return a known disabled-provider error.
     try:
-        hockeytech = KHLHockeyTechClient()
-        payload = await hockeytech.daily_schedule(today)
-        raw_items = payload if isinstance(payload, list) else ((payload.get("SiteKit") or payload.get("games") or payload.get("data") or []) if isinstance(payload, dict) else [])
-        result = []
-        for item in raw_items:
-            if not isinstance(item, dict):
-                continue
-            home = item.get("homeTeam") or item.get("home_team") or item.get("home") or {}
-            away = item.get("awayTeam") or item.get("away_team") or item.get("away") or {}
-            home_name = home.get("name") if isinstance(home, dict) else home
-            away_name = away.get("name") if isinstance(away, dict) else away
-            game_id = item.get("id") or item.get("game_id")
-            if not game_id or not home_name or not away_name:
-                continue
-            result.append({
-                "id": int(game_id),
-                "date": str(item.get("date") or item.get("startTime") or today),
-                "teams": {
-                    "home": {"id": home.get("id") if isinstance(home, dict) else None, "name": display_team_name(str(home_name))},
-                    "away": {"id": away.get("id") if isinstance(away, dict) else None, "name": display_team_name(str(away_name))},
-                },
-                "league": {"name": "КХЛ"},
-                "__khl_hockeytech": True,
-                "__raw_khl_hockeytech": item,
-            })
-        if result:
-            print(f"KHL schedule source: HockeyTech RESERVE ({len(result)} games)", flush=True)
-            return result
+        fallback = SofaScoreKHLClient()
+        games = await fallback.today_games(today)
+        result: list[dict[str, Any]] = []
+        for game in games:
+            teams = game.get("teams") or {}
+            home = teams.get("home") or {}
+            away = teams.get("away") or {}
+            home["name"] = display_team_name(str(home.get("name") or ""))
+            away["name"] = display_team_name(str(away.get("name") or ""))
+            game["teams"] = {"home": home, "away": away}
+            game["__sofascore"] = True
+            result.append(game)
+        print(f"KHL schedule source: SofaScore LAST RESORT ({len(result)} games)", flush=True)
+        return result
     except Exception as exc:
-        print(f"KHL HockeyTech reserve failed: {type(exc).__name__}: {exc}; trying SofaScore last", flush=True)
-
-    fallback = SofaScoreKHLClient()
-    games = await fallback.today_games(today)
-    result: list[dict[str, Any]] = []
-    for game in games:
-        teams = game.get("teams") or {}
-        home = teams.get("home") or {}
-        away = teams.get("away") or {}
-        home["name"] = display_team_name(str(home.get("name") or ""))
-        away["name"] = display_team_name(str(away.get("name") or ""))
-        game["teams"] = {"home": home, "away": away}
-        result.append(game)
-    print(f"KHL schedule source: SofaScore LAST RESORT ({len(result)} games)", flush=True)
-    return result
+        print(f"SofaScore last resort failed: {type(exc).__name__}: {exc}", flush=True)
+        return []
