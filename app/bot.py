@@ -151,8 +151,8 @@ async def callbacks(callback: CallbackQuery) -> None:
         elif data == "about":
             text = (
                 "ℹ️ <b>О боте</b>\n\n"
-                "Бот собирает спортивные данные, проверяет публичные источники, "
-                "рассчитывает вероятности и использует ИИ для итогового анализа.\n\n"
+                "Бот собирает спортивные данные только через браузерный web research, "
+                "проверяет публичные источники и использует ИИ для итогового анализа.\n\n"
                 "Сейчас запускаем первый полноценный раздел — КХЛ."
             )
             markup = main_menu()
@@ -169,26 +169,21 @@ async def callbacks(callback: CallbackQuery) -> None:
             if not games:
                 text = (
                     f"🏒 <b>КХЛ — {_date_label(offset)}</b>\n\n"
-                    "Матчи на эту дату не найдены в доступных источниках."
+                    "Матчи на эту дату не найдены в браузерных источниках."
                 )
                 markup = khl_games_keyboard([])
             else:
-                source = "резервный/смешанный источник"
-                if all(game.get("__khl_mobile") for game in games):
-                    source = "Официальный KHL Mobile API"
-                elif all(game.get("__sofascore") for game in games):
-                    source = "SofaScore web fallback"
                 text = (
                     f"🏒 <b>КХЛ — {_date_label(offset)}</b>\n\n"
                     f"📅 {date_value}\n"
                     f"Матчей: <b>{len(games)}</b>\n"
-                    f"📡 Расписание: <b>{source}</b>\n\n"
+                    "📡 Источник: <b>Browser Web Research</b>\n\n"
                     "Выбери матч:\n\n"
                     "🔄 Расписание автоматически собирается и обновляется каждый день."
                 )
                 markup = khl_games_keyboard(games)
         elif data.startswith("khl:missing:"):
-            text = "⚠️ <b>Матч не имеет идентификатора источника.</b>\n\nНевозможно получить линию и прогноз."
+            text = "⚠️ <b>Матч не имеет идентификатора.</b>\n\nНевозможно получить линию и прогноз."
             markup = back_khl_keyboard()
         elif data.startswith("khl:game:"):
             if ai_predictor is None:
@@ -196,7 +191,7 @@ async def callbacks(callback: CallbackQuery) -> None:
                 markup = main_menu()
             else:
                 game_id = int(data.rsplit(":", 1)[1])
-                await safe_status(callback, "🏒 <b>Глубокий анализ матча</b>\n\n1/6 Нахожу матч и актуальные данные...")
+                await safe_status(callback, "🏒 <b>Глубокий анализ матча</b>\n\n1/6 Нахожу матч в браузерных источниках...")
                 cached = khl_refresh.get_context(game_id)
                 if cached:
                     game, markets, analysis_data = cached
@@ -211,21 +206,20 @@ async def callbacks(callback: CallbackQuery) -> None:
                         if game is not None:
                             break
                     if game is None:
-                        await safe_edit(callback, "Матч не найден. Обнови список матчей КХЛ.", back_khl_keyboard())
+                        await safe_edit(callback, "Матч не найден в браузерных источниках. Обнови список матчей КХЛ.", back_khl_keyboard())
                         return
                     game = normalize_game_names(game)
-                    await safe_status(callback, "🏒 <b>Глубокий анализ матча</b>\n\n2/6 Ищу составы, травмы и дисквалификации...")
+                    await safe_status(callback, "🏒 <b>Глубокий анализ матча</b>\n\n2/6 Ищу составы, травмы и дисквалификации в браузере...")
                     analysis_data = await khl.analysis_for_game(game)
-                    await safe_status(callback, "🏒 <b>Глубокий анализ матча</b>\n\n3/6 Проверяю форму, H2H, таблицу, вратарей и свежие новости...")
+                    await safe_status(callback, "🏒 <b>Глубокий анализ матча</b>\n\n3/6 Проверяю форму, H2H, таблицу, вратарей, новости и линии БК...")
                     markets = await khl.markets_for_game(game_id, game, analysis_data)
                 game = normalize_game_names(game)
                 match = khl.to_match(game, markets, analysis_data)
                 if not match.markets:
-                    source = analysis_data.get("активный_источник_статистики", "резервный источник")
                     text = (
                         khl.format_game(match)
-                        + "\n\n⚠️ <b>Линия букмекеров сейчас недоступна.</b>"
-                        + f"\n📡 Статистика получена из: <b>{source}</b>"
+                        + "\n\n⚠️ <b>Подтверждённая линия БК сейчас не найдена через браузерный ресерч.</b>"
+                        + "\n📡 Источник всей аналитики: <b>Browser Web Research</b>"
                         + "\n\nПрогноз без реального коэффициента не формирую, чтобы не выдумывать линию."
                     )
                     markup = back_khl_keyboard()
@@ -233,15 +227,14 @@ async def callbacks(callback: CallbackQuery) -> None:
                     await safe_status(
                         callback,
                         f"🏒 <b>{match.home} — {match.away}</b>\n\n"
-                        "4/6 Проверяю актуальность найденных данных...\n"
+                        "4/6 Проверяю свежесть найденных веб-данных...\n"
                         "5/6 ИИ оценивает все факторы и ищет только ставки с реальным перевесом...",
                     )
                     try:
                         predictions = await asyncio.wait_for(asyncio.to_thread(ai_predictor.predict, match), timeout=90.0)
                         diagnostic = analysis_data.get("диагностика_статистики", "")
-                        source = analysis_data.get("активный_источник_статистики", "нет")
                         text = khl.format_game(match) + Best3AIPredictor.format(predictions)
-                        text += f"\n\n📡 <b>Статистика:</b> {source}"
+                        text += "\n\n📡 <b>Источник аналитики:</b> Browser Web Research"
                         if diagnostic:
                             text += f"\n🔎 {diagnostic}"
                     except asyncio.TimeoutError:
@@ -261,14 +254,14 @@ async def callbacks(callback: CallbackQuery) -> None:
         await safe_edit(callback, text, markup)
     except ValueError as exc:
         print(f"Application error: {type(exc).__name__}: {exc}", flush=True)
-        await safe_edit(callback, "⚠️ <b>Не удалось получить данные КХЛ.</b>\n\nПроверь источник расписания и идентификатор матча.", main_menu())
+        await safe_edit(callback, "⚠️ <b>Не удалось получить данные КХЛ.</b>\n\nПроверь браузерные источники и идентификатор матча.", main_menu())
         try:
             await callback.answer("Не удалось получить данные", show_alert=False)
         except TelegramBadRequest:
             pass
     except Exception as exc:
         print(f"Unhandled application error: {type(exc).__name__}: {exc}", flush=True)
-        await safe_edit(callback, "⚠️ <b>Не удалось обработать запрос КХЛ.</b>\n\nПопробуй ещё раз — источник мог временно ограничить запросы.", main_menu())
+        await safe_edit(callback, "⚠️ <b>Не удалось обработать запрос КХЛ.</b>\n\nПопробуй ещё раз — браузерный источник мог временно ограничить запросы.", main_menu())
 
 
 async def run_bot() -> None:
