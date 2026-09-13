@@ -6,12 +6,18 @@ from typing import Any
 from .models import Market
 
 
-ODDS_DOMAINS = {
-    "fonbet.kz", "fonbet.ru", "fon.bet", "olimp.bet", "bettery.ru",
-    "legalbet.ru", "legalbet.kz", "legalbet.tj", "vprognoze.kz", "vprognoze.ru",
-    "sportsmotret.online", "leon.ru", "bookmaker-ratings.ru", "betboom.ru",
-    "betcity.ru", "winline.ru", "ligastavok.ru",
+# Only these bookmaker sources are allowed for the KHL market.
+TARGET_BOOKMAKER_DOMAINS = {
+    "winline.ru",
+    "fon.bet",
+    "fonbet.ru",
+    "fonbet.kz",
+    "betboom.ru",
+    "parimatch.com",
+    "parimatch.ru",
 }
+
+ODDS_DOMAINS = TARGET_BOOKMAKER_DOMAINS.copy()
 
 
 def _host(url: str) -> str:
@@ -59,19 +65,18 @@ def _total_55(text: str) -> tuple[float, float] | None:
 
 def _source_score(source: dict[str, Any]) -> int:
     host = _host(str(source.get("url") or ""))
-    if host in {"fonbet.kz", "fonbet.ru", "fon.bet", "olimp.bet", "bettery.ru", "betboom.ru", "betcity.ru", "winline.ru", "ligastavok.ru"}:
-        return 100
-    if host in {"legalbet.ru", "legalbet.kz", "legalbet.tj", "vprognoze.kz", "vprognoze.ru"}:
-        return 75
-    if host in {"sportsmotret.online", "leon.ru", "bookmaker-ratings.ru"}:
-        return 60
-    return 0
+    return 100 if host in TARGET_BOOKMAKER_DOMAINS else 0
 
 
 def markets_from_web_research(web_context: dict[str, Any]) -> tuple[tuple[Market, ...], dict[str, Any]]:
-    """Extract current public-web bookmaker markets; never call a bookmaker API."""
+    """Extract current markets only from Winline, Fonbet, BetBoom or Parimatch.
+
+    No bookmaker API is called. Aggregators, tipster sites and other bookmakers
+    are deliberately rejected as line sources.
+    """
     sources = web_context.get("источники") or []
     candidates: list[tuple[int, dict[str, Any], tuple[float, float, float] | None, tuple[float, float] | None]] = []
+
     for source in sources:
         if not isinstance(source, dict):
             continue
@@ -85,28 +90,32 @@ def markets_from_web_research(web_context: dict[str, Any]) -> tuple[tuple[Market
             candidates.append((score, source, one_x_two, total))
 
     if not candidates:
-        return (), {"статус": "не найдено", "источников_линии": []}
+        return (), {
+            "статус": "не найдено",
+            "источники_линии": [],
+            "разрешенные_БК": ["Winline", "Фонбет", "BetBoom", "Parimatch"],
+        }
 
-    candidates.sort(key=lambda item: (item[0], bool(item[1].get("сниппет"))), reverse=True)
+    candidates.sort(key=lambda item: bool(item[1].get("сниппет")), reverse=True)
     best = candidates[0]
     markets_by_name: dict[str, Market] = {}
     line_sources: dict[str, dict[str, Any]] = {}
 
-    for score, source, one_x_two, total in candidates:
+    for _score, source, one_x_two, total in candidates:
         host = _host(str(source.get("url") or ""))
         if one_x_two:
             for name, odds in zip(("П1", "X", "П2"), one_x_two):
                 current = markets_by_name.get(name)
                 if current is None or odds > current.odds:
                     markets_by_name[name] = Market(name, odds, 1 / odds)
-                    line_sources[name] = {"домен": host, "url": source.get("url"), "приоритет": score}
+                    line_sources[name] = {"БК": host, "url": source.get("url")}
         if total:
             over, under = total
             for name, odds in (("ТБ 5.5", over), ("ТМ 5.5", under)):
                 current = markets_by_name.get(name)
                 if current is None or odds > current.odds:
                     markets_by_name[name] = Market(name, odds, 1 / odds)
-                    line_sources[name] = {"домен": host, "url": source.get("url"), "приоритет": score}
+                    line_sources[name] = {"БК": host, "url": source.get("url")}
 
     one_x_two_names = ("П1", "X", "П2")
     if all(name in markets_by_name for name in one_x_two_names):
@@ -114,6 +123,7 @@ def markets_from_web_research(web_context: dict[str, Any]) -> tuple[tuple[Market
         for name in one_x_two_names:
             old = markets_by_name[name]
             markets_by_name[name] = Market(name, old.odds, (1 / old.odds) / inv_sum)
+
     if all(name in markets_by_name for name in ("ТБ 5.5", "ТМ 5.5")):
         inv_sum = sum(1 / markets_by_name[name].odds for name in ("ТБ 5.5", "ТМ 5.5"))
         for name in ("ТБ 5.5", "ТМ 5.5"):
@@ -123,7 +133,14 @@ def markets_from_web_research(web_context: dict[str, Any]) -> tuple[tuple[Market
     meta = {
         "статус": "найдено",
         "источники_линии": line_sources,
-        "основной_источник": {"домен": _host(str(best[1].get("url") or "")), "url": best[1].get("url")},
-        "правило": "Линия извлечена из свежего публичного веб-источника; спортивные и букмекерские API не используются.",
+        "основной_источник": {
+            "БК": _host(str(best[1].get("url") or "")),
+            "url": best[1].get("url"),
+        },
+        "разрешенные_БК": ["Winline", "Фонбет", "BetBoom", "Parimatch"],
+        "правило": (
+            "Линия принимается только с публичной веб-страницы Winline, Фонбет, "
+            "BetBoom или Parimatch. API букмекеров и сторонние агрегаторы не используются."
+        ),
     }
     return tuple(markets_by_name.values()), meta

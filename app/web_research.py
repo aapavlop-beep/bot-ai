@@ -34,11 +34,12 @@ class KHLWebResearcher:
         "sports.ru", "championat.com", "matchtv.ru", "allhockey.ru",
         "sport-express.ru", "metaratings.ru", "rsport.ria.ru",
     }
+    # Only the four requested bookmakers are treated as bookmaker line sources.
     BOOKMAKER_HINTS = {
-        "fon.bet", "fonbet.ru", "fonbet.kz", "betboom.ru", "betcity.ru",
-        "olimp.bet", "ligastavok.ru", "winline.ru", "bettery.ru", "leon.ru",
-        "legalbet.ru", "legalbet.kz", "legalbet.tj", "vprognoze.ru", "vprognoze.kz",
-        "bookmaker-ratings.ru",
+        "winline.ru",
+        "fon.bet", "fonbet.ru", "fonbet.kz",
+        "betboom.ru",
+        "parimatch.com", "parimatch.ru",
     }
 
     def __init__(self) -> None:
@@ -182,17 +183,15 @@ class KHLWebResearcher:
             f"{home} КХЛ вероятный вратарь {date}",
             f"{away} КХЛ вероятный вратарь {date}",
             f"КХЛ таблица 2026 2027 турнирная таблица",
-            f"{pair} коэффициенты букмекеров {date}",
-            f"{pair} линия П1 X П2 {date}",
-            f"{pair} коэффициенты 1 X 2 {date}",
-            f"{pair} П1 X П2 кэф {date}",
+            f"{pair} коэффициенты Winline Фонбет BetBoom Parimatch {date}",
+            f"{pair} линия П1 X П2 Winline Фонбет BetBoom Parimatch {date}",
+            f"{pair} коэффициенты 1 X 2 Winline Фонбет BetBoom Parimatch {date}",
+            f"site:winline.ru {home} {away} {date}",
             f"site:fon.bet {home} {away} {date}",
             f"site:fonbet.ru {home} {away} {date}",
-            f"site:olimp.bet {home} {away} {date}",
-            f"site:bettery.ru {home} {away} {date}",
-            f"site:legalbet.ru {home} {away} {date}",
-            f"site:vprognoze.ru {home} {away} {date}",
-            f"site:bookmaker-ratings.ru {home} {away} {date}",
+            f"site:betboom.ru {home} {away} {date}",
+            f"site:parimatch.com {home} {away} {date}",
+            f"site:parimatch.ru {home} {away} {date}",
             f"site:khl.ru {home} {away} {date}",
             f"site:khl.ru {home} травма состав {date}",
             f"site:khl.ru {away} травма состав {date}",
@@ -245,8 +244,7 @@ class KHLWebResearcher:
         other_results = [x for x in all_results if self._source_type(x.url) != "bookmaker"]
         bookmaker_results.sort(key=lambda x: bool(x.snippet), reverse=True)
         other_results.sort(key=lambda x: (self._source_priority(x.url), bool(x.snippet)), reverse=True)
-        # Force bookmaker evidence into the fetched set. Previously the 24-page
-        # priority sort could crowd every bookmaker page out with KHL/media pages.
+        # Force bookmaker evidence into the fetched set.
         candidates = (bookmaker_results[:12] + other_results[: max(0, self.MAX_PAGES - min(12, len(bookmaker_results)))])[: self.MAX_PAGES]
 
         pages = await asyncio.gather(*(self._extract_page(item) for item in candidates), return_exceptions=True)
