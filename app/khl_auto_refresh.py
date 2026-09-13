@@ -12,7 +12,7 @@ MSK = ZoneInfo("Europe/Moscow")
 
 
 class KHLBackgroundCache:
-    """Continuously maintain today's and near-future KHL schedule."""
+    """Continuously maintain today's and near-future KHL schedule from web research."""
 
     def __init__(self, service, interval_minutes: int = 30, days_ahead: int = 3) -> None:
         self.service = service
@@ -37,7 +37,7 @@ class KHLBackgroundCache:
                     self.games_by_date[date_value] = games
                     self.updated_at_by_date[date_value] = time.time()
                     print(
-                        f"KHL daily collector: date={date_value} games={len(games)} source=KHL mobile/web",
+                        f"KHL daily collector: date={date_value} games={len(games)} source=BROWSER WEB RESEARCH",
                         flush=True,
                     )
                 self.last_refresh_date = current_date
@@ -45,7 +45,7 @@ class KHLBackgroundCache:
                 self.games_by_date = {k: v for k, v in self.games_by_date.items() if k in keep}
                 self.updated_at_by_date = {k: v for k, v in self.updated_at_by_date.items() if k in keep}
             except Exception as exc:
-                print(f"KHL daily collector failed: {type(exc).__name__}: {exc}", flush=True)
+                print(f"KHL daily browser collector failed: {type(exc).__name__}: {exc}", flush=True)
 
     async def loop(self) -> None:
         await self.refresh()
@@ -55,7 +55,7 @@ class KHLBackgroundCache:
 
     def start(self) -> None:
         if self.task is None or self.task.done():
-            self.task = asyncio.create_task(self.loop(), name="khl-daily-collector")
+            self.task = asyncio.create_task(self.loop(), name="khl-daily-browser-collector")
 
     async def stop(self) -> None:
         if self.task is not None and not self.task.done():
