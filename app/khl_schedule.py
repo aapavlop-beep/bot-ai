@@ -6,6 +6,8 @@ from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from bs4 import BeautifulSoup
+
 from .team_names import display_team_name
 from .web_research import KHLWebResearcher, SearchResult
 
@@ -56,70 +58,76 @@ def _is_khl_team(value: str) -> bool:
     return any(low == team.lower() or low in team.lower() or team.lower() in low for team in KHL_TEAMS)
 
 
+def _build_game(date_value: str, time_value: str, raw_home: str, raw_away: str) -> dict[str, Any] | None:
+    home = _canonical_team(raw_home)
+    away = _canonical_team(raw_away)
+    if not _is_khl_team(home) or not _is_khl_team(away) or home == away:
+        return None
+    return {
+        "id": _game_id(date_value, home, away),
+        "date": date_value,
+        "datetime": f"{date_value}T{time_value}:00+03:00",
+        "teams": {
+            "home": {"name": display_team_name(home)},
+            "away": {"name": display_team_name(away)},
+        },
+        "league": {"name": "КХЛ"},
+        "__web_research": True,
+    }
+
+
 def _extract_fixtures(text: str, date_value: str) -> list[dict[str, Any]]:
-    """Extract KHL fixtures from browser-retrieved schedule text/snippets."""
     text = text.replace("–", "—").replace("−", "—")
-    year = datetime.fromisoformat(date_value).year
     date_full = datetime.fromisoformat(date_value).strftime("%d.%m.%Y")
     date_short = datetime.fromisoformat(date_value).strftime("%d.%m")
     patterns = [
-        re.compile(
-            rf"{re.escape(date_full)}\s+(?:{re.escape(date_full)}\s+)?(\d{{1,2}}:\d{{2}})\s+(.{{2,60}}?)\s+—\s+(.{{2,60}}?)(?=\s*\||\s*-\s*:\s*-|\s+КХЛ|\s+регуляр|$)",
-            re.I,
-        ),
-        re.compile(
-            rf"{re.escape(date_short)}\.?\s*(?:{year}\s+)?(\d{{1,2}}:\d{{2}})\s+(.{{2,60}}?)\s+—\s+(.{{2,60}}?)(?=\s*\||\s*-\s*:\s*-|\s+КХЛ|\s+регуляр|$)",
-            re.I,
-        ),
-        re.compile(
-            rf"(\d{{1,2}}:\d{{2}})\s+(.{{2,60}}?)\s+—\s+(.{{2,60}}?)(?=\s*\||\s*-\s*:\s*-|\s+КХЛ|\s+регуляр|$)",
-            re.I,
-        ),
+        re.compile(rf"{re.escape(date_full)}\s+(?:{re.escape(date_full)}\s+)?(\d{{1,2}}:\d{{2}})\s+(.{{2,60}}?)\s+—\s+(.{{2,60}}?)(?=\s*\||\s*-\s*:\s*-|\s+КХЛ|\s+регуляр|$)", re.I),
+        re.compile(rf"{re.escape(date_short)}\.?\s*(?:\d{{4}}\s+)?(\d{{1,2}}:\d{{2}})\s+(.{{2,60}}?)\s+—\s+(.{{2,60}}?)(?=\s*\||\s*-\s*:\s*-|\s+КХЛ|\s+регуляр|$)", re.I),
     ]
     found: list[dict[str, Any]] = []
     for pattern in patterns:
         for match in pattern.finditer(text):
-            time_value, raw_home, raw_away = [m.strip(" -–—|") for m in match.groups()]
-            home = _canonical_team(raw_home)
-            away = _canonical_team(raw_away)
-            if not _is_khl_team(home) or not _is_khl_team(away) or home == away:
-                continue
-            item = {
-                "id": _game_id(date_value, home, away),
-                "date": date_value,
-                "datetime": f"{date_value}T{time_value}:00+03:00",
-                "teams": {
-                    "home": {"name": display_team_name(home)},
-                    "away": {"name": display_team_name(away)},
-                },
-                "league": {"name": "КХЛ"},
-                "__web_research": True,
-            }
-            if not any(x["id"] == item["id"] for x in found):
-                found.append(item)
+            game = _build_game(date_value, *[m.strip(" -–—|") for m in match.groups()])
+            if game and not any(x["id"] == game["id"] for x in found):
+                found.append(game)
     return found
+
+
+async def _extract_direct_calendar(researcher: KHLWebResearcher, url: str, date_value: str) -> list[dict[str, Any]]:
+    try:
+        response = await researcher._client.get(url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        # Keep table text; do not limit extraction to <article>/<main>, because
+        # Championat's calendar is rendered in a table outside those containers.
+        text = _normalize_text(soup.get_text(" ", strip=True))
+        return _extract_fixtures(text, date_value)
+    except Exception as exc:
+        print(f"KHL direct calendar failed: {url}: {type(exc).__name__}: {exc}", flush=True)
+        return []
 
 
 async def _web_games_for_date(date_value: str) -> list[dict[str, Any]]:
     researcher = KHLWebResearcher()
-    unique: dict[str, SearchResult] = {}
+    games: list[dict[str, Any]] = []
 
-    # Direct browser-page seeds. These are normal public webpages, not sports
-    # APIs, and they prevent a temporary Google/Bing rate-limit from making the
-    # daily schedule empty.
+    # Primary browser page. It contains the complete 2026/27 KHL calendar.
     direct_urls = [
         "https://www.championat.com/hockey/_superleague/tournament/7092/calendar/",
         "https://www.championat.com/hockey/_superleague.html",
         f"https://x2sport.ru/calendar?from={date_value}",
     ]
     for url in direct_urls:
-        unique[url] = SearchResult("KHL browser schedule", url, "")
+        for game in await _extract_direct_calendar(researcher, url, date_value):
+            if not any(x["id"] == game["id"] for x in games):
+                games.append(game)
+        if len(games) >= 4:
+            break
 
-    # Search is supplemental: if a search engine is available it can discover
-    # newer calendar pages or another schedule source. A 429 is non-fatal.
+    # Search is supplemental only. A Google 429 must never erase the direct
+    # browser-page results.
     queries = [
         f'КХЛ {date_value} расписание матчи',
-        f'КХЛ {date_value} календарь игр',
         f'site:championat.com/hockey/_superleague {date_value} КХЛ расписание',
     ]
     for query in queries:
@@ -128,30 +136,12 @@ async def _web_games_for_date(date_value: str) -> list[dict[str, Any]]:
         except Exception as exc:
             print(f"KHL schedule web search failed: {type(exc).__name__}: {exc}", flush=True)
             continue
-        for result in results:
-            if result.url not in unique:
-                unique[result.url] = result
-
-    results = list(unique.values())
-    results.sort(key=lambda r: (
-        2 if "championat.com/hockey/_superleague/tournament/7092/calendar" in r.url else
-        1 if "championat.com" in r.url else 0,
-        1 if "x2sport.ru" in r.url else 0,
-    ), reverse=True)
-
-    games: list[dict[str, Any]] = []
-    for result in results[:15]:
-        texts = [result.snippet]
-        try:
-            page = await researcher._extract_page(result)
-            if page.text:
-                texts.insert(0, page.text)
-        except Exception as exc:
-            print(f"KHL schedule page failed: {result.url}: {type(exc).__name__}", flush=True)
-        for text in texts:
-            for game in _extract_fixtures(_normalize_text(text), date_value):
-                if not any(x["id"] == game["id"] for x in games):
-                    games.append(game)
+        for result in results[:6]:
+            text = result.snippet
+            if text:
+                for game in _extract_fixtures(_normalize_text(text), date_value):
+                    if not any(x["id"] == game["id"] for x in games):
+                        games.append(game)
 
     games.sort(key=lambda x: x.get("datetime", ""))
     return games
