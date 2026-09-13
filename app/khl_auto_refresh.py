@@ -12,12 +12,7 @@ MSK = ZoneInfo("Europe/Moscow")
 
 
 class KHLBackgroundCache:
-    """Continuously maintain today's and near-future KHL schedule.
-
-    The schedule is refreshed every interval and automatically rolls over at
-    midnight Moscow time. Per-date caches let Telegram show today/tomorrow
-    without making a fresh request for every button press.
-    """
+    """Continuously maintain today's and near-future KHL schedule."""
 
     def __init__(self, service, interval_minutes: int = 30, days_ahead: int = 3) -> None:
         self.service = service
@@ -38,18 +33,14 @@ class KHLBackgroundCache:
             current_date = dates[0]
             try:
                 for date_value in dates:
-                    # The first date is refreshed most often. Future dates are
-                    # collected too, so the bot already knows what is coming.
-                    games = await verified_games_for_date(self.service.client, date_value)
+                    games = await verified_games_for_date(date_value)
                     self.games_by_date[date_value] = games
                     self.updated_at_by_date[date_value] = time.time()
                     print(
-                        f"KHL daily collector: date={date_value} games={len(games)} "
-                        f"API requests total={self.service.client.request_count}",
+                        f"KHL daily collector: date={date_value} games={len(games)} source=KHL mobile/web",
                         flush=True,
                     )
                 self.last_refresh_date = current_date
-                # Drop dates that are no longer relevant after a date rollover.
                 keep = set(dates)
                 self.games_by_date = {k: v for k, v in self.games_by_date.items() if k in keep}
                 self.updated_at_by_date = {k: v for k, v in self.updated_at_by_date.items() if k in keep}
