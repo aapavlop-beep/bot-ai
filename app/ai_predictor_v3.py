@@ -47,25 +47,23 @@ def _json_safe(value, seen=None, depth: int = 0):
 
 
 class Best3AIPredictor(AIPredictor):
-    """Evidence-first analyst: return only lines worth considering.
-
-    The model may return zero, one, two or three recommendations. There is no
-    fallback that fabricates a recommendation merely to fill a top-3 list.
-    """
+    """Browser-evidence-first analyst: return only lines worth considering."""
 
     SYSTEM_PROMPT = (
         "Ты профессиональный спортивный аналитик. Отвечай только на русском. "
         "Твоя задача — найти только ставки, на которые действительно стоит обратить внимание. "
         "НЕ нужно выдавать прогноз на каждый матч и НЕ нужно заполнять список до трёх позиций. "
         "Если доказательств недостаточно или value отсутствует, верни пустой список. "
-        "Сначала изучи спортивный_контекст и статистика_для_ии, затем веб-исследование. "
-        "В веб-исследовании используй только подтверждённые факты: состав, травма, дисквалификация, вратарь, форма, H2H, таблица, домашний/гостевой фактор, нагрузка, перелёты и свежие новости. "
+        "КРИТИЧЕСКОЕ ПРАВИЛО: для КХЛ используй ТОЛЬКО данные, переданные в разделе веб-исследования. "
+        "Не используй внешнюю память модели как источник фактов и не додумывай сведения, которых нет в веб-доказательствах. "
+        "Все факты о матче, составе, травмах, дисквалификациях, вратарях, форме, H2H, таблице, нагрузке, новостях и коэффициентах должны быть подтверждены браузерным web research. "
         "Не делай вывод 'травмирован', если источник только показывает отсутствие игрока. "
-        "Для свежих кадровых новостей приоритет: официальный KHL/клуб, затем крупное спортивное СМИ. "
+        "Для свежих кадровых новостей приоритет официальному KHL/клубу, затем крупному спортивному СМИ. "
         "Учитывай дату публикации и не используй старую новость как подтверждение текущего состава без оговорки. "
-        "Коэффициент допустим только если он есть среди переданных доступных_линий; веб-упоминание коэффициента само по себе не создаёт линию. "
+        "Коэффициент допустим только если он есть среди переданных доступных_линий и подтверждён браузерным поиском у Winline, Фонбет, BetBoom или Parimatch. "
+        "Не используй API-SPORT, KHL Mobile API, SofaScore, другие спортивные API, неидентифицированные агрегаторы или выдуманные значения. "
         "Не выдумывай коэффициенты, игроков, травмы, составы, статистику или результаты. "
-        "Оцени вероятность самостоятельно, но не отклоняйся от рыночной вероятности более чем на 20 процентных пунктов без очень сильных подтверждённых оснований. "
+        "Оцени вероятность самостоятельно, но не отклоняйся от рыночной вероятности более чем на 20 процентных пунктов без очень сильных подтверждённых веб-оснований. "
         "Справедливый КФ = 100 / вероятность. Value = (коэффициент * вероятность / 100 - 1) * 100. "
         "Сильный кандидат обычно должен иметь положительное value и уверенность не ниже 6/10. "
         "Если есть только слабое преимущество, не рекомендуй ставку. "
@@ -121,37 +119,21 @@ class Best3AIPredictor(AIPredictor):
 
     @staticmethod
     def _data_quality(match: Match) -> float:
-        q = match.analysis_data.get("качество_активных_данных") or {}
-        home = int(q.get("история_хозяев") or 0)
-        away = int(q.get("история_гостей") or 0)
-        h2h = int(q.get("h2h") or 0)
-        seasonal = bool(q.get("есть_сезонная_статистика") or q.get("есть_таблица"))
         web = match.analysis_data.get("веб_исследование") or {}
         sources = int(web.get("источников_всего") or len(web.get("источники") or []))
         official = sum(1 for s in web.get("источники") or [] if s.get("тип_источника") == "official")
+        bookmaker = sum(1 for s in web.get("источники") or [] if s.get("тип_источника") == "bookmaker")
         score = 1.0
-        if match.analysis_data.get("активный_источник_статистики") not in (None, "нет"):
-            score += 2.0
-        if home >= 8:
-            score += 1.5
-        elif home >= 5:
-            score += 1.0
-        elif home > 0:
-            score += 0.5
-        if away >= 8:
-            score += 1.5
-        elif away >= 5:
-            score += 1.0
-        elif away > 0:
-            score += 0.5
-        if seasonal:
-            score += 1.0
-        if h2h >= 3:
-            score += 0.5
+        if match.analysis_data.get("режим_источника") == "browser-only web research":
+            score += 3.0
         if sources >= 8:
+            score += 2.0
+        elif sources >= 4:
             score += 1.0
         if official:
-            score += 0.5
+            score += 1.0
+        if bookmaker:
+            score += 1.0
         return min(score, 10.0)
 
     def predict(self, match: Match) -> tuple[Recommendation, ...]:
@@ -174,13 +156,13 @@ class Best3AIPredictor(AIPredictor):
             "гости": match.away,
             "начало": match.start_time,
             "качество_данных_0_10": quality,
-            "активный_источник_статистики": match.analysis_data.get("активный_источник_статистики", "нет"),
-            "режим_источника": match.analysis_data.get("режим_источника", ""),
+            "активный_источник_статистики": "browser web research",
+            "режим_источника": "browser-only web research",
             "статистика_для_ии": _json_safe(match.analysis_data.get("статистика_для_ии", {})),
             "веб_исследование": _json_safe(match.analysis_data.get("веб_исследование", {})),
             "спортивный_контекст": analysis_data,
             "доступные_линии": markets,
-            "задача": "Найди только действительно сильные ставки. Если нет достаточного преимущества — recommendations=[]; не заполняй список искусственно.",
+            "задача": "Найди только действительно сильные ставки на основании браузерных доказательств. Если нет достаточного преимущества — recommendations=[]; не заполняй список искусственно.",
         }
         data = self._request(payload)
         raw_recs = data.get("recommendations") or []
@@ -206,8 +188,6 @@ class Best3AIPredictor(AIPredictor):
             fair_odds = 100 / probability
             value = (market.odds * probability / 100 - 1) * 100
             edge = probability - market_probability
-            # Hard post-filter: no weak candidate gets shown just because the
-            # model returned it. This is the final gate for "worth attention".
             if confidence < 6.0 or value < 2.0 or edge < 1.0:
                 continue
             result.append(Recommendation(
@@ -218,7 +198,7 @@ class Best3AIPredictor(AIPredictor):
                 round(fair_odds, 2),
                 round(value, 1),
                 round(edge, 1),
-                str(raw.get("reason") or "Подтверждённый статистический перевес."),
+                str(raw.get("reason") or "Подтверждённый браузерным ресерчем перевес."),
             ))
             if len(result) >= 3:
                 break
@@ -246,5 +226,5 @@ class Best3AIPredictor(AIPredictor):
                 f"🧠 Уверенность: <b>{rec.confidence:.1f}/10</b>\n"
                 f"Почему: {rec.reason}"
             )
-        lines.append("\n⚠️ Ранжирование основано на доступных подтверждённых данных; результат матча не гарантирован.")
+        lines.append("\n⚠️ Ранжирование основано на браузерных источниках; результат матча не гарантирован.")
         return "\n".join(lines)
