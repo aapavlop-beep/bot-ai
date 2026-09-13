@@ -219,16 +219,22 @@ async def callbacks(callback: CallbackQuery) -> None:
                     await safe_status(callback, "🏒 <b>Глубокий анализ матча</b>\n\n2/6 Ищу составы, травмы и дисквалификации...")
                     analysis_data = await khl.analysis_for_game(game)
                     await safe_status(callback, "🏒 <b>Глубокий анализ матча</b>\n\n3/6 Проверяю форму, H2H, таблицу, вратарей и свежие новости...")
-                    markets = await khl.markets_for_game(game_id, game)
+                    markets = await khl.markets_for_game(game_id, game, analysis_data)
                 game = normalize_game_names(game)
+                # Cached contexts from older deployments may not contain web odds;
+                # refresh the bookmaker line once if the market list is empty.
+                if not markets and analysis_data:
+                    markets = await khl.markets_for_game(game_id, game, analysis_data)
                 match = khl.to_match(game, markets, analysis_data)
                 if not match.markets:
                     source = analysis_data.get("активный_источник_статистики", "резервный источник")
+                    web_status = (analysis_data.get("веб_линии") or {}).get("статус", "не найдено")
                     text = (
                         khl.format_game(match)
-                        + "\n\n⚠️ <b>Линия букмекеров сейчас недоступна.</b>"
-                        + f"\n📡 Статистика получена из: <b>{source}</b>"
-                        + "\n\nПрогноз без реального коэффициента не формирую, чтобы не выдумывать линию."
+                        + "\n\n⚠️ <b>Актуальная линия не найдена.</b>"
+                        + f"\n📡 Статистика: <b>{source}</b>"
+                        + f"\n🌐 Веб-линия: <b>{web_status}</b>"
+                        + "\n\nБез подтверждённого коэффициента прогноз не формирую."
                     )
                     markup = back_khl_keyboard()
                 else:
@@ -242,8 +248,12 @@ async def callbacks(callback: CallbackQuery) -> None:
                         predictions = await asyncio.wait_for(asyncio.to_thread(ai_predictor.predict, match), timeout=90.0)
                         diagnostic = analysis_data.get("диагностика_статистики", "")
                         source = analysis_data.get("активный_источник_статистики", "нет")
+                        line_meta = analysis_data.get("веб_линии") or {}
+                        line_source = (line_meta.get("основной_источник") or {}).get("домен")
                         text = khl.format_game(match) + Best3AIPredictor.format(predictions)
                         text += f"\n\n📡 <b>Статистика:</b> {source}"
+                        if line_source:
+                            text += f"\n💰 <b>Линия:</b> {line_source}"
                         if diagnostic:
                             text += f"\n🔎 {diagnostic}"
                     except asyncio.TimeoutError:
