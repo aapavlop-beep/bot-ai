@@ -4,7 +4,6 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any
 
-from .providers.api_sport_ru import ApiSportRuClient
 from .providers.khl_mobile import KHLMobileClient
 from .providers.sofascore_khl import SofaScoreKHLClient
 from .team_names import display_team_name
@@ -55,37 +54,22 @@ async def _mobile_games_for_date(date_value: str) -> list[dict[str, Any]]:
     return result
 
 
-async def verified_games_for_date(client: ApiSportRuClient, date_value: str) -> list[dict[str, Any]]:
-    """Return the KHL schedule for an exact Moscow date with layered failover."""
-    try:
-        games = await client.khl_matches(date_value)
-        result: list[dict[str, Any]] = []
-        for raw in sorted(games, key=ApiSportRuClient._match_date):
-            game = ApiSportRuClient.normalize_match(raw)
-            teams = game.get("teams") or {}
-            home = teams.get("home") or {}
-            away = teams.get("away") or {}
-            home["name"] = display_team_name(str(home.get("name") or ""))
-            away["name"] = display_team_name(str(away.get("name") or ""))
-            game["teams"] = {"home": home, "away": away}
-            game["__api_sport_ru"] = True
-            game["__raw_api_sport_ru"] = raw
-            result.append(game)
-        if result:
-            print(f"KHL schedule source: API-SPORT.ru ({len(result)} games) date={date_value}", flush=True)
-            return result
-        print(f"KHL API-SPORT.ru returned no games date={date_value}; trying official KHL mobile API", flush=True)
-    except Exception as exc:
-        print(f"KHL API-SPORT.ru failed date={date_value}: {type(exc).__name__}: {exc}; trying official KHL mobile API", flush=True)
-
+async def verified_games_for_date(date_value: str) -> list[dict[str, Any]]:
+    """Return the KHL schedule without contacting API-SPORT.ru."""
     try:
         result = await _mobile_games_for_date(date_value)
         if result:
-            print(f"KHL schedule source: OFFICIAL KHL MOBILE API RESERVE ({len(result)} games) date={date_value}", flush=True)
+            print(
+                f"KHL schedule source: OFFICIAL KHL MOBILE API ({len(result)} games) date={date_value}",
+                flush=True,
+            )
             return result
-        print(f"Official KHL mobile API returned no games date={date_value}; trying SofaScore last", flush=True)
+        print(f"Official KHL mobile API returned no games date={date_value}; trying SofaScore web fallback", flush=True)
     except Exception as exc:
-        print(f"Official KHL mobile API failed date={date_value}: {type(exc).__name__}: {exc}; trying SofaScore last", flush=True)
+        print(
+            f"Official KHL mobile API failed date={date_value}: {type(exc).__name__}: {exc}; trying SofaScore web fallback",
+            flush=True,
+        )
 
     try:
         fallback = SofaScoreKHLClient()
@@ -100,16 +84,16 @@ async def verified_games_for_date(client: ApiSportRuClient, date_value: str) -> 
             game["teams"] = {"home": home, "away": away}
             game["__sofascore"] = True
             result.append(game)
-        print(f"KHL schedule source: SofaScore LAST RESORT ({len(result)} games) date={date_value}", flush=True)
+        print(f"KHL schedule source: SofaScore web fallback ({len(result)} games) date={date_value}", flush=True)
         return result
     except Exception as exc:
-        print(f"SofaScore last resort failed date={date_value}: {type(exc).__name__}: {exc}", flush=True)
+        print(f"SofaScore web fallback failed date={date_value}: {type(exc).__name__}: {exc}", flush=True)
         return []
 
 
-async def verified_today_games(client: ApiSportRuClient) -> list[dict[str, Any]]:
+async def verified_today_games() -> list[dict[str, Any]]:
     today = datetime.now(MSK).date().isoformat()
-    return await verified_games_for_date(client, today)
+    return await verified_games_for_date(today)
 
 
 def upcoming_moscow_dates(days: int = 3) -> list[str]:
