@@ -4,15 +4,17 @@ from typing import Any
 
 from .models import Market, Match, Sport
 from .providers.api_sport_ru import ApiSportRuClient
+from .providers.khl_mobile import KHLMobileClient
 from .providers.sofascore_khl import SofaScoreKHLClient
 
 
 class EnhancedKHLService:
-    """KHL service with API-SPORT.ru primary and SofaScore reserve source."""
+    """KHL service with API-SPORT.ru primary and official KHL mobile reserve."""
 
     def __init__(self, client: ApiSportRuClient) -> None:
         self.client = client
         self.api_sport_ru = client
+        self.khl_mobile = KHLMobileClient()
         self.sofascore = SofaScoreKHLClient()
 
     @staticmethod
@@ -41,12 +43,8 @@ class EnhancedKHLService:
         return next(
             (
                 item for item in candidates
-                if self._same_team(
-                    str((item.get("teams") or {}).get("home", {}).get("name") or ""), home
-                )
-                and self._same_team(
-                    str((item.get("teams") or {}).get("away", {}).get("name") or ""), away
-                )
+                if self._same_team(str((item.get("teams") or {}).get("home", {}).get("name") or ""), home)
+                and self._same_team(str((item.get("teams") or {}).get("away", {}).get("name") or ""), away)
             ),
             None,
         )
@@ -73,7 +71,13 @@ class EnhancedKHLService:
             if markets:
                 return markets
         except Exception as exc:
-            print(f"API-SPORT.ru odds failed: {type(exc).__name__}: {exc}; trying SofaScore reserve", flush=True)
+            print(f"API-SPORT.ru odds failed: {type(exc).__name__}: {exc}; odds unavailable from reserve", flush=True)
+
+        # The official KHL mobile API is the reliable reserve for match data,
+        # but it is not treated as a bookmaker odds feed. Never invent odds.
+        if game is not None and game.get("__khl_mobile"):
+            print("KHL mobile reserve: match data available; bookmaker odds are unavailable", flush=True)
+            return ()
 
         try:
             reserve_game = await self._find_sofascore_match(game or {}) if game else None
@@ -84,19 +88,47 @@ class EnhancedKHLService:
         return ()
 
     async def analysis_for_game(self, game: dict[str, Any]) -> dict[str, Any]:
-        """Collect context from the primary source or automatically use SofaScore reserve."""
+        """Collect KHL context using layered sources without hiding source failures."""
+        if game.get("__khl_mobile"):
+            home = str(((game.get("teams") or {}).get("home") or {}).get("name") or "")
+            away = str(((game.get("teams") or {}).get("away") or {}).get("name") or "")
+            start = str(game.get("date") or game.get("datetime") or "")
+            context = await self.khl_mobile.build_match_context(home, away, start)
+            context["активный_источник_статистики"] = "Официальный KHL mobile API"
+            context["резервный_источник"] = "KHL mobile API"
+            return context
+
         if game.get("__sofascore"):
-            return await self.sofascore.build_context(game)
+            context = await self.sofascore.build_context(game)
+            context["активный_источник_статистики"] = "SofaScore"
+            context["резервный_источник"] = "SofaScore"
+            return context
+
         try:
-            return await self.api_sport_ru.build_context(game)
+            context = await self.api_sport_ru.build_context(game)
+            context["активный_источник_статистики"] = "API-SPORT.ru"
+            return context
         except Exception as exc:
-            print(f"API-SPORT.ru KHL context failed: {type(exc).__name__}: {exc}; trying SofaScore reserve", flush=True)
+            print(f"API-SPORT.ru KHL context failed: {type(exc).__name__}: {exc}; trying official KHL mobile API", flush=True)
+            home = str(((game.get("teams") or {}).get("home") or {}).get("name") or "")
+            away = str(((game.get("teams") or {}).get("away") or {}).get("name") or "")
+            start = str(game.get("date") or game.get("datetime") or "")
+            try:
+                context = await self.khl_mobile.build_match_context(home, away, start)
+                context["активный_источник_статистики"] = "Официальный KHL mobile API"
+                context["резервный_источник"] = "KHL mobile API"
+                return context
+            except Exception as mobile_exc:
+                print(f"Official KHL mobile API context failed: {type(mobile_exc).__name__}: {mobile_exc}; trying SofaScore last", flush=True)
             match = await self._find_sofascore_match(game)
             if match is None:
-                raise RuntimeError("Не удалось сопоставить матч с резервным источником SofaScore") from exc
+                raise RuntimeError("Не удалось получить данные КХЛ из API-SPORT.ru и официального KHL mobile API") from exc
             game.clear()
             game.update(match)
-            return await self.sofascore.build_context(game)
+            context = await self.sofascore.build_context(game)
+            context["активный_источник_статистики"] = "SofaScore"
+            context["резервный_источник"] = "SofaScore LAST RESORT"
+            return context
 
     @staticmethod
     def to_match(game: dict[str, Any], markets: tuple[Market, ...] = (), analysis_data: dict[str, Any] | None = None) -> Match:
