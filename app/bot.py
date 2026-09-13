@@ -11,11 +11,11 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from .ai_predictor_v2 import Best3AIPredictor
+from .ai_predictor_v3 import Best3AIPredictor
 from .config import settings
 from .khl_auto_refresh import KHLBackgroundCache
 from .khl_enhanced import EnhancedKHLService
-from .khl_schedule import verified_games_for_date, verified_today_games
+from .khl_schedule import verified_games_for_date
 from .keyboards import main_menu
 from .providers.api_sport_ru import ApiSportRuClient, ApiSportRuError
 from .storage import PredictionStore
@@ -25,8 +25,6 @@ MSK = ZoneInfo("Europe/Moscow")
 
 dp = Dispatcher()
 store = PredictionStore(settings.database_path)
-# The KHL service must exist even without API-SPORT credentials: the schedule
-# can be obtained from the official KHL mobile reserve and web research.
 khl = EnhancedKHLService(ApiSportRuClient(settings.api_sport_ru_key or ""))
 ai_predictor = Best3AIPredictor(settings.openai_api_key, settings.openai_model, settings.openai_base_url) if settings.openai_api_key else None
 khl_refresh = KHLBackgroundCache(khl, interval_minutes=30, days_ahead=3)
@@ -161,7 +159,7 @@ async def callbacks(callback: CallbackQuery) -> None:
             )
             markup = main_menu()
         elif data == "top":
-            text = "🔥 <b>Лучшие прогнозы</b>\n\nПосле обновления аналитики здесь будут отображаться лучшие кандидаты по всем матчам."
+            text = "🔥 <b>Лучшие прогнозы</b>\n\nПосле обновления аналитики здесь будут отображаться только кандидаты, прошедшие фильтр качества данных и value."
             markup = main_menu()
         elif data == "sport:khl" or data.startswith("khl:date:"):
             offset = 0 if data == "sport:khl" else int(data.rsplit(":", 1)[1])
@@ -205,7 +203,8 @@ async def callbacks(callback: CallbackQuery) -> None:
                 if cached:
                     game, markets, analysis_data = cached
                 else:
-                    games = []
+                    game = None
+                    games: list[dict] = []
                     for date_value in (_date_by_offset(i) for i in range(3)):
                         games = khl_refresh.get_games(date_value)
                         if not games:
@@ -218,10 +217,8 @@ async def callbacks(callback: CallbackQuery) -> None:
                         return
                     game = normalize_game_names(game)
                     await safe_status(callback, "🏒 <b>Глубокий анализ матча</b>\n\n2/6 Ищу составы, травмы и дисквалификации...")
-                    # analysis_for_game performs multi-source public-web research
-                    # in addition to API/reserve statistics.
                     analysis_data = await khl.analysis_for_game(game)
-                    await safe_status(callback, "🏒 <b>Глубокий анализ матча</b>\n\n3/6 Проверяю форму, H2H, таблицу и последние результаты...")
+                    await safe_status(callback, "🏒 <b>Глубокий анализ матча</b>\n\n3/6 Проверяю форму, H2H, таблицу, вратарей и свежие новости...")
                     markets = await khl.markets_for_game(game_id, game)
                 game = normalize_game_names(game)
                 match = khl.to_match(game, markets, analysis_data)
@@ -239,7 +236,7 @@ async def callbacks(callback: CallbackQuery) -> None:
                         callback,
                         f"🏒 <b>{match.home} — {match.away}</b>\n\n"
                         "4/6 Проверяю актуальность найденных данных...\n"
-                        "5/6 ИИ оценивает все факторы и ищет перевес над линией...",
+                        "5/6 ИИ оценивает все факторы и ищет только ставки с реальным перевесом...",
                     )
                     try:
                         predictions = await asyncio.wait_for(asyncio.to_thread(ai_predictor.predict, match), timeout=90.0)
@@ -250,10 +247,10 @@ async def callbacks(callback: CallbackQuery) -> None:
                         if diagnostic:
                             text += f"\n🔎 {diagnostic}"
                     except asyncio.TimeoutError:
-                        print("AI prediction error: TimeoutError: AI did not answer within 90 seconds")
+                        print("AI prediction error: TimeoutError: AI did not answer within 90 seconds", flush=True)
                         text = khl.format_game(match) + "\n\n⚠️ <b>ИИ не успел ответить.</b>\nПопробуй запрос ещё раз."
                     except Exception as exc:
-                        print(f"AI prediction error: {type(exc).__name__}: {exc}")
+                        print(f"AI prediction error: {type(exc).__name__}: {exc}", flush=True)
                         text = khl.format_game(match) + "\n\n⚠️ <b>ИИ-прогноз временно недоступен.</b>\nОшибка: " + type(exc).__name__
                 markup = back_khl_keyboard()
         elif data.startswith("sport:"):
@@ -265,24 +262,22 @@ async def callbacks(callback: CallbackQuery) -> None:
             markup = main_menu()
         await safe_edit(callback, text, markup)
     except (ApiSportRuError, ValueError) as exc:
-        print(f"Application error: {type(exc).__name__}: {exc}")
+        print(f"Application error: {type(exc).__name__}: {exc}", flush=True)
         await safe_edit(callback, "⚠️ <b>Не удалось получить данные КХЛ.</b>\n\nОсновной и резервный источники временно недоступны.", main_menu())
         try:
             await callback.answer("Не удалось получить данные", show_alert=False)
         except TelegramBadRequest:
             pass
     except Exception as exc:
-        print(f"Unhandled application error: {type(exc).__name__}: {exc}")
+        print(f"Unhandled application error: {type(exc).__name__}: {exc}", flush=True)
         await safe_edit(callback, "⚠️ <b>Не удалось обработать запрос КХЛ.</b>\n\nПопробуй ещё раз — источник мог временно ограничить запросы.", main_menu())
 
 
 async def run_bot() -> None:
     bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    if khl_refresh is not None:
-        khl_refresh.start()
+    khl_refresh.start()
     try:
         await dp.start_polling(bot)
     finally:
-        if khl_refresh is not None:
-            await khl_refresh.stop()
+        await khl_refresh.stop()
         await bot.session.close()
