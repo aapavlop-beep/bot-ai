@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import re
 from urllib.parse import urlparse
 
-from .web_research import KHLWebResearcher
+from playwright.async_api import Page
+
+from .web_odds import _first_1x2, _normalize
+from .web_research import KHLWebResearcher, SearchResult
 
 
 BOOKMAKER_DOMAINS = {
@@ -18,26 +20,12 @@ def _host(url: str) -> str:
     return urlparse(url).netloc.lower().removeprefix("www.")
 
 
-def _normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").replace("ё", "е")).strip()
-
-
-def _odds(value: str) -> float | None:
-    try:
-        odd = float(value.replace(",", "."))
-        return odd if 1.01 <= odd <= 100 else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _triplets(text: str) -> list[tuple[float, float, float]]:
-    text = _normalize(text)
-    values: list[float] = []
-    for raw in re.findall(r"(?<!\d)(?:1[.,]\d{1,3}|[2-9][.,]\d{1,3}|1\d[.,]\d{1,3}|20[.,]\d{1,3})(?!\d)", text):
-        odd = _odds(raw)
-        if odd is not None:
-            values.append(odd)
-    return [values[i:i + 3] for i in range(len(values) - 2) if all(1.10 <= x <= 20 for x in values[i:i + 3])]
+def _bookmaker_from_host(url: str) -> str | None:
+    host = _host(url)
+    for bookmaker, domains in BOOKMAKER_DOMAINS.items():
+        if any(host == d or host.endswith("." + d) for d in domains):
+            return bookmaker
+    return None
 
 
 def _contains_team(text: str, team: str) -> bool:
@@ -48,7 +36,7 @@ def _contains_team(text: str, team: str) -> bool:
     if team in text:
         return True
     aliases = {
-        "динамо москва": ("динамо м", "dynamo moscow"),
+        "динамо москва": ("динамо м", "dynamo moscow", "dynamo moskva"),
         "динамо минск": ("динамо мн", "dynamo minsk"),
         "металлург мг": ("металлург магнитогорск", "metallurg magnitogorsk"),
         "цска": ("цска москва", "cska"),
@@ -59,67 +47,153 @@ def _contains_team(text: str, team: str) -> bool:
     return any(alias in text for alias in aliases.get(team, ()))
 
 
-def _bookmaker_from_host(url: str) -> str | None:
-    host = _host(url)
-    for bookmaker, domains in BOOKMAKER_DOMAINS.items():
-        if any(host == d or host.endswith("." + d) for d in domains):
-            return bookmaker
-    return None
-
-
-def _parse_evidence(text: str, home: str, away: str, bookmaker: str) -> tuple[float, float, float] | None:
-    text = _normalize(text)
-    if not _contains_team(text, home) or not _contains_team(text, away):
+def _evidence_1x2(text: str, home: str, away: str) -> tuple[float, float, float] | None:
+    normalized = _normalize(text)
+    if not _contains_team(normalized, home) or not _contains_team(normalized, away):
         return None
-    marker = re.search(r"winline|винлайн|fonbet|фонбет|fon\.bet|betboom|бетбум|parimatch|пари матч", text, re.I)
-    windows = [text]
-    if marker:
-        windows.insert(0, text[max(0, marker.start() - 1200): min(len(text), marker.end() + 2500)])
-    for window in windows:
-        trips = _triplets(window)
-        if trips:
-            return tuple(trips[0])
-    return None
+
+    # Prefer a block containing both team names so numbers from another event
+    # on the same bookmaker page are not mistaken for this match's line.
+    low = normalized.lower()
+    home_pos = low.find(_normalize(home).lower())
+    away_pos = low.find(_normalize(away).lower())
+    if home_pos >= 0 and away_pos >= 0:
+        start = max(0, min(home_pos, away_pos) - 900)
+        end = min(len(normalized), max(home_pos, away_pos) + 2500)
+        parsed = _first_1x2(normalized[start:end])
+        if parsed:
+            return parsed
+
+    return _first_1x2(normalized)
 
 
-async def search_bookmaker_web(home: str, away: str, date: str) -> tuple[dict[str, float], dict[str, str]]:
-    """Find 1X2 odds using real Chromium browser search only.
+async def _search_all_engines(
+    researcher: KHLWebResearcher,
+    page: Page,
+    query: str,
+) -> list[SearchResult]:
+    """Collect results from Yandex, Bing and Google in Chromium.
 
-    A line is accepted only when the opened page itself belongs to Winline,
-    Fonbet, BetBoom or Parimatch. Aggregators are never treated as bookmaker
-    confirmation.
+    The generic researcher intentionally stops at the first engine with
+    results. That is fine for ordinary research, but bookmaker pages are often
+    absent from one engine. Odds discovery therefore queries all three.
+    """
+    results_by_url: dict[str, SearchResult] = {}
+    engines = (
+        ("Yandex", researcher._search_yandex),
+        ("Bing", researcher._search_bing),
+        ("Google", researcher._search_google),
+    )
+    for name, engine in engines:
+        try:
+            results = await engine(page, query)
+            print(
+                f"KHL bookmaker browser search: {name} -> {len(results)} results | {query}",
+                flush=True,
+            )
+            for result in results:
+                if result.url.startswith("http"):
+                    results_by_url.setdefault(result.url, result)
+        except Exception as exc:
+            print(
+                f"KHL bookmaker browser search failed ({name}): {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+    return list(results_by_url.values())
+
+
+async def search_bookmaker_web(
+    home: str,
+    away: str,
+    date: str,
+) -> tuple[dict[str, float], dict[str, str]]:
+    """Find current 1X2 odds through Chromium browser research only.
+
+    A quote is accepted only from a Winline, Fonbet, BetBoom or Parimatch
+    domain and only after the opened page contains both teams and a parsed
+    1-X-2 market. Search-engine snippets alone are never accepted as odds.
     """
     researcher = KHLWebResearcher()
     date_ru = f"{date[8:10]}.{date[5:7]}.{date[:4]}" if len(date) >= 10 else date
     queries = [
-        f'"{home}" "{away}" {date_ru} Winline коэффициенты 1X2',
-        f'"{home}" "{away}" {date_ru} Fonbet коэффициенты 1X2',
-        f'"{home}" "{away}" {date_ru} BetBoom коэффициенты 1X2',
-        f'"{home}" "{away}" {date_ru} Parimatch коэффициенты 1X2',
-        f'"{home}" "{away}" {date_ru} Winline Fonbet BetBoom Parimatch линия',
+        f'"{home}" "{away}" {date_ru} Winline 1X2',
+        f'"{home}" "{away}" {date_ru} Fonbet 1X2',
+        f'"{home}" "{away}" {date_ru} BetBoom 1X2',
+        f'"{home}" "{away}" {date_ru} Parimatch 1X2',
+        f'site:winline.ru "{home}" "{away}" {date_ru}',
+        f'site:fon.bet "{home}" "{away}" {date_ru}',
+        f'site:betboom.ru "{home}" "{away}" {date_ru}',
+        f'site:parimatch.com "{home}" "{away}" {date_ru}',
     ]
 
     markets: dict[str, float] = {}
     sources: dict[str, str] = {}
+    checked_urls: set[str] = set()
+    page = await researcher._new_page()
     try:
         for query in queries:
-            results = await researcher.search(query)
-            for result in results:
+            results = await _search_all_engines(researcher, page, query)
+            direct_results = [
+                result for result in results if _bookmaker_from_host(result.url)
+            ]
+            print(
+                f"KHL bookmaker candidates: direct={len(direct_results)} query={query}",
+                flush=True,
+            )
+
+            for result in direct_results:
                 bookmaker = _bookmaker_from_host(result.url)
-                if not bookmaker:
+                if not bookmaker or result.url in checked_urls:
                     continue
-                evidence = _parse_evidence(result.title + " " + result.snippet, home, away, bookmaker)
+                checked_urls.add(result.url)
+
+                evidence = _evidence_1x2(
+                    f"{result.title} {result.snippet}", home, away
+                )
                 if evidence is None:
-                    page = await researcher.fetch_page(result.url)
-                    evidence = _parse_evidence(page.title + " " + page.text, home, away, bookmaker)
+                    loaded = await researcher.fetch_page(result.url)
+                    evidence = _evidence_1x2(
+                        f"{loaded.title} {loaded.text} {result.snippet}",
+                        home,
+                        away,
+                    )
+
                 if evidence is None:
+                    print(
+                        f"KHL bookmaker page rejected: {bookmaker} {result.url} "
+                        "(no team-matched 1X2 market)",
+                        flush=True,
+                    )
                     continue
+
+                print(
+                    f"KHL bookmaker odds confirmed: {bookmaker} {result.url} "
+                    f"P1={evidence[0]} X={evidence[1]} P2={evidence[2]}",
+                    flush=True,
+                )
                 for name, odd in zip(("П1", "X", "П2"), evidence):
                     if name not in markets or odd > markets[name]:
                         markets[name] = odd
                         sources[name] = bookmaker
-                if len(markets) == 3:
-                    return markets, sources
+
+            if len(markets) == 3:
+                break
     finally:
+        await page.context.close()
         await researcher.close()
+
+    if markets:
+        print(
+            "KHL browser bookmaker line ready: "
+            + ", ".join(
+                f"{name}={odd} ({sources.get(name, '')})"
+                for name, odd in markets.items()
+            ),
+            flush=True,
+        )
+    else:
+        print(
+            "KHL browser bookmaker research: no confirmed Winline/Fonbet/BetBoom/Parimatch line found",
+            flush=True,
+        )
     return markets, sources
