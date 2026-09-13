@@ -9,11 +9,7 @@ from .web_research import KHLWebResearcher
 
 
 class EnhancedKHLService:
-    """KHL analysis using browser-style web research only.
-
-    No sports API is consulted here. All match facts, team news and bookmaker
-    lines must come from the web-research layer.
-    """
+    """KHL analysis using real browser web research only."""
 
     def __init__(self) -> None:
         self.web_research = KHLWebResearcher()
@@ -30,7 +26,7 @@ class EnhancedKHLService:
             analysis_data["веб_линии"] = meta
             if markets:
                 analysis_data["режим_линии"] = "browser web research"
-                print(f"KHL web odds: found {len(markets)} markets", flush=True)
+                print(f"KHL web odds: found {len(markets)} markets from browser evidence", flush=True)
                 return markets
 
         if game:
@@ -43,12 +39,12 @@ class EnhancedKHLService:
                 if odds:
                     markets = tuple(Market(name, odd, 1 / odd) for name, odd in odds.items())
                     if analysis_data is not None:
-                        analysis_data["режим_линии"] = "dedicated browser bookmaker research"
+                        analysis_data["режим_линии"] = "dedicated Chromium browser research"
                         analysis_data["веб_линии"] = {
                             "статус": "найдено",
                             "разрешенные_БК": ["Winline", "Фонбет", "BetBoom", "Parimatch"],
                             "источники_линии": {
-                                name: {"БК": bookmakers.get(name, ""), "тип": "browser web research"}
+                                name: {"БК": bookmakers.get(name, ""), "тип": "Chromium browser web research"}
                                 for name in odds
                             },
                         }
@@ -61,15 +57,14 @@ class EnhancedKHLService:
             except Exception as exc:
                 print(f"KHL browser bookmaker research failed: {type(exc).__name__}: {exc}", flush=True)
 
-        print("KHL web odds: no confirmed Winline/Fonbet/BetBoom/Parimatch line found", flush=True)
+        print("KHL browser bookmaker research: no confirmed Winline/Fonbet/BetBoom/Parimatch line found", flush=True)
         return ()
 
     async def analysis_for_game(self, game: dict[str, Any]) -> dict[str, Any]:
         teams = game.get("teams") or {}
         home = str((teams.get("home") or {}).get("name") or "")
         away = str((teams.get("away") or {}).get("name") or "")
-        start = str(game.get("date") or game.get("datetime") or "")
-        date = start[:10]
+        date = str(game.get("date") or game.get("datetime") or "")[:10]
 
         try:
             web_context = await self.web_research.research_match(home, away, date)
@@ -79,37 +74,34 @@ class EnhancedKHLService:
                 "собрано_в_utc": "",
                 "матч": f"{home} — {away}",
                 "дата_матча": date,
-                "метод": "Google/Bing web search + HTML page extraction",
+                "метод": "Chromium browser web research",
                 "источники": [],
                 "ошибка": type(exc).__name__,
             }
 
-        source_count = len(web_context.get("источники") or [])
-        official_count = sum(1 for s in web_context.get("источники") or [] if s.get("тип_источника") == "official")
+        sources = web_context.get("источники", []) or []
+        official_count = sum(1 for s in sources if s.get("тип_источника") == "official")
         analysis_data: dict[str, Any] = {
             "активный_источник_статистики": "browser web research",
             "резервный_источник": "browser web research",
             "режим_источника": "browser-only web research",
             "веб_исследование": web_context,
-            "веб_источники": web_context.get("источники", []),
-            "источники_проверки": [s.get("url") for s in web_context.get("источники", []) if s.get("url")][:20],
+            "веб_источники": sources,
+            "источники_проверки": [s.get("url") for s in sources if s.get("url")][:20],
             "статистика_для_ии": web_context,
             "качество_активных_данных": {
-                "история_хозяев": 0,
-                "история_гостей": 0,
-                "h2h": 0,
                 "есть_сезонная_статистика": bool((web_context.get("структурированные_доказательства") or {}).get("standings")),
                 "есть_таблица": bool((web_context.get("структурированные_доказательства") or {}).get("standings")),
-                "web_sources": source_count,
+                "web_sources": len(sources),
                 "official_sources": official_count,
             },
             "правило_травм_и_составов": (
-                "Использовать только явно подтверждённые веб-источниками сведения. "
+                "Использовать только явно подтверждённые браузерными источниками сведения. "
                 "Отсутствие игрока в составе само по себе не означает травму."
             ),
             "правило_коэффициентов": (
                 "Использовать только текущие коэффициенты Winline, Фонбет, BetBoom или Parimatch, "
-                "полученные через браузерный web research. Не использовать API, SofaScore или неидентифицированные линии."
+                "полученные через Chromium browser research. Не использовать API, SofaScore или неидентифицированные линии."
             ),
         }
         return analysis_data
@@ -117,10 +109,8 @@ class EnhancedKHLService:
     @staticmethod
     def to_match(game: dict[str, Any], markets: tuple[Market, ...] = (), analysis_data: dict[str, Any] | None = None) -> Match:
         teams = game.get("teams") or {}
-        home_obj = teams.get("home") or {}
-        away_obj = teams.get("away") or {}
-        home = str(home_obj.get("name") or "Хозяева")
-        away = str(away_obj.get("name") or "Гости")
+        home = str((teams.get("home") or {}).get("name") or "Хозяева")
+        away = str((teams.get("away") or {}).get("name") or "Гости")
         league = str((game.get("league") or {}).get("name") or "КХЛ")
         start_time = str(game.get("date") or game.get("datetime") or "")
         return Match(
