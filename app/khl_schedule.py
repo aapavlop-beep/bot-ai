@@ -71,15 +71,33 @@ def _build_game(date_value: str, time_value: str, raw_home: str, raw_away: str) 
 
 
 def _extract_fixtures(text: str, date_value: str) -> list[dict[str, Any]]:
-    text = text.replace("–", "—").replace("−", "—")
+    """Extract fixtures from public calendar/search HTML.
+
+    Championat duplicates date/time columns and represents an empty score as
+    "– : –". The old parser only accepted ASCII hyphens, which caused a valid
+    browser result to become zero games. Keep the parser deliberately strict
+    about team names but tolerant about dash/score formatting.
+    """
+    text = _normalize_text(text).replace("−", "—").replace("–", "—")
     date_full = datetime.fromisoformat(date_value).strftime("%d.%m.%Y")
     date_short = datetime.fromisoformat(date_value).strftime("%d.%m")
-    # Championat's table contains the date/time twice because the visible table
-    # has a duplicated date column. Handle that exact form first.
+    score_marker = r"—\s*:\s*—"
     patterns = [
-        re.compile(rf"{re.escape(date_full)}\s+(\d{{1,2}}:\d{{2}})\s+{re.escape(date_full)}\s+\1\s+(.{{2,60}}?)\s+—\s+(.{{2,60}}?)(?=\s*\||\s*-\s*:\s*-|\s+КХЛ|\s+регуляр|$)", re.I),
-        re.compile(rf"{re.escape(date_full)}\s+(\d{{1,2}}:\d{{2}})\s+(.{{2,60}}?)\s+—\s+(.{{2,60}}?)(?=\s*\||\s*-\s*:\s*-|\s+КХЛ|\s+регуляр|$)", re.I),
-        re.compile(rf"{re.escape(date_short)}\.?\s*(?:\d{{4}}\s+)?(\d{{1,2}}:\d{{2}})\s+(.{{2,60}}?)\s+—\s+(.{{2,60}}?)(?=\s*\||\s*-\s*:\s*-|\s+КХЛ|\s+регуляр|$)", re.I),
+        re.compile(
+            rf"{re.escape(date_full)}\s+(\d{{1,2}}:\d{{2}})\s+"
+            rf"{re.escape(date_full)}\s+\1\s+(.{{2,80}}?)\s+—\s+(.{{2,80}}?)(?=\s*(?:\||{score_marker}|\bКХЛ\b|\bрегуляр|$))",
+            re.I,
+        ),
+        re.compile(
+            rf"{re.escape(date_full)}\s+(\d{{1,2}}:\d{{2}})\s+"
+            rf"(.{{2,80}}?)\s+—\s+(.{{2,80}}?)(?=\s*(?:\||{score_marker}|\bКХЛ\b|\bрегуляр|$))",
+            re.I,
+        ),
+        re.compile(
+            rf"{re.escape(date_short)}\.?\s*(?:\d{{4}}\s+)?(\d{{1,2}}:\d{{2}})\s+"
+            rf"(.{{2,80}}?)\s+—\s+(.{{2,80}}?)(?=\s*(?:\||{score_marker}|\bКХЛ\b|\bрегуляр|$))",
+            re.I,
+        ),
     ]
     found: list[dict[str, Any]] = []
     for pattern in patterns:
@@ -112,8 +130,9 @@ async def _web_games_for_date(date_value: str) -> list[dict[str, Any]]:
     direct_urls = [
         "https://www.championat.com/hockey/_superleague/tournament/7092/calendar/",
         "https://www.championat.com/hockey/_superleague.html",
-        f"https://x2sport.ru/calendar?from={date_value}",
     ]
+
+    # First use real public calendar pages, not sports APIs.
     for url in direct_urls:
         for game in await _extract_direct_calendar(researcher, url, date_value):
             if not any(x["id"] == game["id"] for x in games):
@@ -121,22 +140,25 @@ async def _web_games_for_date(date_value: str) -> list[dict[str, Any]]:
         if len(games) >= 4:
             break
 
-    # Search is supplemental and can be rate-limited; direct browser pages above
-    # remain the authoritative schedule collection path.
+    # Search snippets are a second browser-only fallback. This also works when
+    # the calendar HTML is blocked by a hosting provider.
     for query in (
         f'КХЛ {date_value} расписание матчи',
-        f'site:championat.com/hockey/_superleague {date_value} КХЛ расписание',
+        f'"{datetime.fromisoformat(date_value).strftime("%d.%m.%Y")}" КХЛ матчи',
+        f'site:championat.com/hockey {_normalize_text(date_value)} КХЛ расписание',
     ):
         try:
             results = await researcher.search(query)
         except Exception as exc:
             print(f"KHL schedule web search failed: {type(exc).__name__}: {exc}", flush=True)
             continue
-        for result in results[:6]:
-            if result.snippet:
-                for game in _extract_fixtures(_normalize_text(result.snippet), date_value):
-                    if not any(x["id"] == game["id"] for x in games):
-                        games.append(game)
+        for result in results[:10]:
+            payload = " ".join((result.title, result.snippet, result.text))
+            for game in _extract_fixtures(_normalize_text(payload), date_value):
+                if not any(x["id"] == game["id"] for x in games):
+                    games.append(game)
+        if len(games) >= 4:
+            break
 
     games.sort(key=lambda x: x.get("datetime", ""))
     return games
