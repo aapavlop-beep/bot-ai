@@ -151,7 +151,7 @@ async def callbacks(callback: CallbackQuery) -> None:
         elif data == "about":
             text = (
                 "ℹ️ <b>О боте</b>\n\n"
-                "Бот собирает спортивные данные только через браузерный web research, "
+                "Бот собирает спортивные данные только через Chromium browser web research, "
                 "проверяет публичные источники и использует ИИ для итогового анализа.\n\n"
                 "Сейчас запускаем первый полноценный раздел — КХЛ."
             )
@@ -167,10 +167,7 @@ async def callbacks(callback: CallbackQuery) -> None:
                 games = await __import__("app.khl_schedule", fromlist=["verified_games_for_date"]).verified_games_for_date(date_value)
             games = [normalize_game_names(game) for game in games]
             if not games:
-                text = (
-                    f"🏒 <b>КХЛ — {_date_label(offset)}</b>\n\n"
-                    "Матчи на эту дату не найдены в браузерных источниках."
-                )
+                text = f"🏒 <b>КХЛ — {_date_label(offset)}</b>\n\nМатчи на эту дату не найдены в браузерных источниках."
                 markup = khl_games_keyboard([])
             else:
                 text = (
@@ -187,7 +184,7 @@ async def callbacks(callback: CallbackQuery) -> None:
             markup = back_khl_keyboard()
         elif data.startswith("khl:game:"):
             if ai_predictor is None:
-                text = "⚠️ <b>ИИ не настроен.</b>\n\nДобавь OPENAI_API_KEY в переменные Railway и перезапусти бота."
+                text = "⚠️ <b>ИИ не настроен.</b>\n\nДобавь OPENAI_API_KEY в .env и перезапусти бота."
                 markup = main_menu()
             else:
                 game_id = int(data.rsplit(":", 1)[1])
@@ -271,4 +268,5 @@ async def run_bot() -> None:
         await dp.start_polling(bot)
     finally:
         await khl_refresh.stop()
+        await khl.web_research.close()
         await bot.session.close()
