@@ -22,20 +22,28 @@ KHL_TEAMS = {
     "Куньлунь Ред Стар", "Куньлунь",
 }
 
+ALIASES = {
+    "динамо м": "Динамо Москва",
+    "динамо москва": "Динамо Москва",
+    "динамо мн": "Динамо Минск",
+    "динамо минск": "Динамо Минск",
+    "металлург мг": "Металлург Мг",
+    "металлург магнитогорск": "Металлург Мг",
+    "металлург магнитогорск (мг)": "Металлург Мг",
+    "хк сочи": "ХК Сочи",
+    "сочи": "ХК Сочи",
+    "цска москва": "ЦСКА",
+    "цска": "ЦСКА",
+    "шд": "Шанхайские Драконы",
+    "куньлунь ред стар": "Куньлунь Ред Стар",
+}
+
 
 def _canonical_team(value: str) -> str:
     value = re.sub(r"[«»\"()]", "", value or "")
-    value = re.sub(r"\s+", " ", value).strip(" -–—|")
+    value = re.sub(r"\s+", " ", value).strip(" -–—|·")
     low = value.lower()
-    aliases = {
-        "динамо м": "Динамо Москва", "динамо москва": "Динамо Москва",
-        "динамо мн": "Динамо Минск", "динамо минск": "Динамо Минск",
-        "металлург мг": "Металлург Мг", "металлург магнитогорск": "Металлург Мг",
-        "хк сочи": "ХК Сочи", "сочи": "ХК Сочи",
-        "цска москва": "ЦСКА", "цска": "ЦСКА",
-        "шд": "Шанхайские Драконы",
-    }
-    return aliases.get(low, display_team_name(value))
+    return ALIASES.get(low, display_team_name(value))
 
 
 def _game_id(date_value: str, home: str, away: str) -> int:
@@ -44,7 +52,10 @@ def _game_id(date_value: str, home: str, away: str) -> int:
 
 
 def _normalize_text(value: str) -> str:
-    return re.sub(r"\s+", " ", value or "").strip()
+    value = value or ""
+    value = value.replace("−", "-").replace("–", "-").replace("—", "-")
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
 
 
 def _is_khl_team(value: str) -> bool:
@@ -70,36 +81,34 @@ def _build_game(date_value: str, time_value: str, raw_home: str, raw_away: str) 
     }
 
 
+def _team_pattern() -> str:
+    names = sorted(KHL_TEAMS | set(ALIASES.keys()), key=len, reverse=True)
+    return "(?:" + "|".join(re.escape(x) for x in names) + ")"
+
+
 def _extract_fixtures(text: str, date_value: str) -> list[dict[str, Any]]:
-    """Extract fixtures from public calendar/search HTML."""
-    text = _normalize_text(text).replace("−", "—").replace("–", "—")
-    date_full = datetime.fromisoformat(date_value).strftime("%d.%m.%Y")
-    date_short = datetime.fromisoformat(date_value).strftime("%d.%m")
-    score_marker = r"—\s*:\s*—"
-    patterns = [
-        re.compile(
-            rf"{re.escape(date_full)}\s+(\d{{1,2}}:\d{{2}})\s+"
-            rf"{re.escape(date_full)}\s+\1\s+(.{{2,80}}?)\s+—\s+(.{{2,80}}?)(?=\s*(?:\||{score_marker}|\bКХЛ\b|\bрегуляр|$))",
-            re.I,
-        ),
-        re.compile(
-            rf"{re.escape(date_full)}\s+(\d{{1,2}}:\d{{2}})\s+"
-            rf"(.{{2,80}}?)\s+—\s+(.{{2,80}}?)(?=\s*(?:\||{score_marker}|\bКХЛ\b|\bрегуляр|$))",
-            re.I,
-        ),
-        re.compile(
-            rf"{re.escape(date_short)}\.?\s*(?:\d{{4}}\s+)?(\d{{1,2}}:\d{{2}})\s+"
-            rf"(.{{2,80}}?)\s+—\s+(.{{2,80}}?)(?=\s*(?:\||{score_marker}|\bКХЛ\b|\bрегуляр|$))",
-            re.I,
-        ),
-    ]
+    """Parse KHL games from browser/search text without relying on a sports API."""
+    text = _normalize_text(text)
+    if not text:
+        return []
+
+    team = _team_pattern()
     found: list[dict[str, Any]] = []
+
+    # Main form used by Championat/search snippets:
+    # 13.09.2026 17:00 13.09.2026 17:00 ЦСКА - Локомотив - : -
+    patterns = [
+        re.compile(rf"(?:\d{{1,2}}\.\d{{1,2}}\.\d{{4}}\s+)?(\d{{1,2}}:\d{{2}})(?:\s+\d{{1,2}}\.\d{{1,2}}\.\d{{4}}\s+\1)?\s+({team})\s*-\s*({team})", re.I),
+        re.compile(rf"(\d{{1,2}}:\d{{2}})\s+({team})\s*[|/:]?\s*-\s*\s*({team})", re.I),
+    ]
+
     for pattern in patterns:
         for match in pattern.finditer(text):
-            time_value, raw_home, raw_away = [m.strip(" -–—|") for m in match.groups()]
+            time_value, raw_home, raw_away = match.groups()
             game = _build_game(date_value, time_value, raw_home, raw_away)
             if game and not any(x["id"] == game["id"] for x in found):
                 found.append(game)
+
     return found
 
 
@@ -108,10 +117,25 @@ async def _extract_direct_calendar(researcher: KHLWebResearcher, url: str, date_
         response = await researcher._client.get(url)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
-        text = _normalize_text(soup.get_text(" ", strip=True))
-        games = _extract_fixtures(text, date_value)
+
+        # Prefer table rows because calendar pages often duplicate date/time columns.
+        chunks: list[str] = []
+        for row in soup.select("tr"):
+            row_text = row.get_text(" ", strip=True)
+            if row_text:
+                chunks.append(row_text)
+        chunks.append(soup.get_text(" ", strip=True))
+
+        games: list[dict[str, Any]] = []
+        for chunk in chunks:
+            for game in _extract_fixtures(chunk, date_value):
+                if not any(x["id"] == game["id"] for x in games):
+                    games.append(game)
+
         if games:
             print(f"KHL browser page parsed: {url} -> {len(games)} games", flush=True)
+        else:
+            print(f"KHL browser page returned no fixtures: {url}", flush=True)
         return games
     except Exception as exc:
         print(f"KHL direct calendar failed: {url}: {type(exc).__name__}: {exc}", flush=True)
@@ -121,36 +145,51 @@ async def _extract_direct_calendar(researcher: KHLWebResearcher, url: str, date_
 async def _web_games_for_date(date_value: str) -> list[dict[str, Any]]:
     researcher = KHLWebResearcher()
     games: list[dict[str, Any]] = []
+    date_obj = datetime.fromisoformat(date_value)
+    date_full = date_obj.strftime("%d.%m.%Y")
+    date_words = date_obj.strftime("%d %B %Y")
+
+    # Public browser pages only. No KHL/API/SofaScore data providers are used here.
     direct_urls = [
         "https://www.championat.com/hockey/_superleague/tournament/7092/calendar/",
         "https://www.championat.com/hockey/_superleague.html",
     ]
 
-    for url in direct_urls:
-        for game in await _extract_direct_calendar(researcher, url, date_value):
-            if not any(x["id"] == game["id"] for x in games):
-                games.append(game)
-        if len(games) >= 4:
-            break
-
-    date_full = datetime.fromisoformat(date_value).strftime("%d.%m.%Y")
-    for query in (
-        f"КХЛ {date_value} расписание матчи",
-        f'"{date_full}" КХЛ матчи',
-        f"site:championat.com/hockey {date_value} КХЛ расписание",
-    ):
-        try:
-            results = await researcher.search(query)
-        except Exception as exc:
-            print(f"KHL schedule web search failed: {type(exc).__name__}: {exc}", flush=True)
-            continue
-        for result in results[:10]:
-            payload = " ".join((result.title, result.snippet, result.text))
-            for game in _extract_fixtures(_normalize_text(payload), date_value):
+    try:
+        for url in direct_urls:
+            for game in await _extract_direct_calendar(researcher, url, date_value):
                 if not any(x["id"] == game["id"] for x in games):
                     games.append(game)
-        if len(games) >= 4:
-            break
+            if games:
+                # The calendar page contains the complete KHL table; do not hammer search engines.
+                break
+
+        # Search fallback. Keep this sequential and small to avoid Google/Bing/DDG rate limits.
+        if not games:
+            queries = [
+                f'КХЛ "{date_full}" расписание матчи',
+                f'КХЛ "{date_full}" ЦСКА Локомотив Сибирь Автомобилист',
+                f'КХЛ {date_words} расписание',
+                f'site:championat.com/hockey/_superleague/tournament/7092/calendar "{date_full}"',
+            ]
+            for query in queries:
+                try:
+                    results = await researcher.search(query)
+                except Exception as exc:
+                    print(f"KHL schedule web search failed: {type(exc).__name__}: {exc}", flush=True)
+                    continue
+                for result in results[:10]:
+                    payload = " ".join((result.title, result.snippet, result.text))
+                    for game in _extract_fixtures(payload, date_value):
+                        if not any(x["id"] == game["id"] for x in games):
+                            games.append(game)
+                if games:
+                    break
+    finally:
+        try:
+            await researcher._client.aclose()
+        except Exception:
+            pass
 
     games.sort(key=lambda x: x.get("datetime", ""))
     return games
