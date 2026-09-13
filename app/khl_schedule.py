@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup
 
 from .team_names import display_team_name
-from .web_research import KHLWebResearcher, SearchResult
+from .web_research import KHLWebResearcher
 
 MSK = ZoneInfo("Europe/Moscow")
 
@@ -28,16 +28,11 @@ def _canonical_team(value: str) -> str:
     value = re.sub(r"\s+", " ", value).strip(" -–—|")
     low = value.lower()
     aliases = {
-        "динамо м": "Динамо Москва",
-        "динамо москва": "Динамо Москва",
-        "динамо мн": "Динамо Минск",
-        "динамо минск": "Динамо Минск",
-        "металлург мг": "Металлург Мг",
-        "металлург магнитогорск": "Металлург Мг",
-        "хк сочи": "ХК Сочи",
-        "сочи": "ХК Сочи",
-        "цска москва": "ЦСКА",
-        "цска": "ЦСКА",
+        "динамо м": "Динамо Москва", "динамо москва": "Динамо Москва",
+        "динамо мн": "Динамо Минск", "динамо минск": "Динамо Минск",
+        "металлург мг": "Металлург Мг", "металлург магнитогорск": "Металлург Мг",
+        "хк сочи": "ХК Сочи", "сочи": "ХК Сочи",
+        "цска москва": "ЦСКА", "цска": "ЦСКА",
         "шд": "Шанхайские Драконы",
     }
     return aliases.get(low, display_team_name(value))
@@ -53,8 +48,7 @@ def _normalize_text(value: str) -> str:
 
 
 def _is_khl_team(value: str) -> bool:
-    value = _canonical_team(value)
-    low = value.lower()
+    low = _canonical_team(value).lower()
     return any(low == team.lower() or low in team.lower() or team.lower() in low for team in KHL_TEAMS)
 
 
@@ -80,14 +74,18 @@ def _extract_fixtures(text: str, date_value: str) -> list[dict[str, Any]]:
     text = text.replace("–", "—").replace("−", "—")
     date_full = datetime.fromisoformat(date_value).strftime("%d.%m.%Y")
     date_short = datetime.fromisoformat(date_value).strftime("%d.%m")
+    # Championat's table contains the date/time twice because the visible table
+    # has a duplicated date column. Handle that exact form first.
     patterns = [
-        re.compile(rf"{re.escape(date_full)}\s+(?:{re.escape(date_full)}\s+)?(\d{{1,2}}:\d{{2}})\s+(.{{2,60}}?)\s+—\s+(.{{2,60}}?)(?=\s*\||\s*-\s*:\s*-|\s+КХЛ|\s+регуляр|$)", re.I),
+        re.compile(rf"{re.escape(date_full)}\s+(\d{{1,2}}:\d{{2}})\s+{re.escape(date_full)}\s+\1\s+(.{{2,60}}?)\s+—\s+(.{{2,60}}?)(?=\s*\||\s*-\s*:\s*-|\s+КХЛ|\s+регуляр|$)", re.I),
+        re.compile(rf"{re.escape(date_full)}\s+(\d{{1,2}}:\d{{2}})\s+(.{{2,60}}?)\s+—\s+(.{{2,60}}?)(?=\s*\||\s*-\s*:\s*-|\s+КХЛ|\s+регуляр|$)", re.I),
         re.compile(rf"{re.escape(date_short)}\.?\s*(?:\d{{4}}\s+)?(\d{{1,2}}:\d{{2}})\s+(.{{2,60}}?)\s+—\s+(.{{2,60}}?)(?=\s*\||\s*-\s*:\s*-|\s+КХЛ|\s+регуляр|$)", re.I),
     ]
     found: list[dict[str, Any]] = []
     for pattern in patterns:
         for match in pattern.finditer(text):
-            game = _build_game(date_value, *[m.strip(" -–—|") for m in match.groups()])
+            time_value, raw_home, raw_away = [m.strip(" -–—|") for m in match.groups()]
+            game = _build_game(date_value, time_value, raw_home, raw_away)
             if game and not any(x["id"] == game["id"] for x in found):
                 found.append(game)
     return found
@@ -98,10 +96,11 @@ async def _extract_direct_calendar(researcher: KHLWebResearcher, url: str, date_
         response = await researcher._client.get(url)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
-        # Keep table text; do not limit extraction to <article>/<main>, because
-        # Championat's calendar is rendered in a table outside those containers.
         text = _normalize_text(soup.get_text(" ", strip=True))
-        return _extract_fixtures(text, date_value)
+        games = _extract_fixtures(text, date_value)
+        if games:
+            print(f"KHL browser page parsed: {url} -> {len(games)} games", flush=True)
+        return games
     except Exception as exc:
         print(f"KHL direct calendar failed: {url}: {type(exc).__name__}: {exc}", flush=True)
         return []
@@ -110,8 +109,6 @@ async def _extract_direct_calendar(researcher: KHLWebResearcher, url: str, date_
 async def _web_games_for_date(date_value: str) -> list[dict[str, Any]]:
     researcher = KHLWebResearcher()
     games: list[dict[str, Any]] = []
-
-    # Primary browser page. It contains the complete 2026/27 KHL calendar.
     direct_urls = [
         "https://www.championat.com/hockey/_superleague/tournament/7092/calendar/",
         "https://www.championat.com/hockey/_superleague.html",
@@ -124,22 +121,20 @@ async def _web_games_for_date(date_value: str) -> list[dict[str, Any]]:
         if len(games) >= 4:
             break
 
-    # Search is supplemental only. A Google 429 must never erase the direct
-    # browser-page results.
-    queries = [
+    # Search is supplemental and can be rate-limited; direct browser pages above
+    # remain the authoritative schedule collection path.
+    for query in (
         f'КХЛ {date_value} расписание матчи',
         f'site:championat.com/hockey/_superleague {date_value} КХЛ расписание',
-    ]
-    for query in queries:
+    ):
         try:
             results = await researcher.search(query)
         except Exception as exc:
             print(f"KHL schedule web search failed: {type(exc).__name__}: {exc}", flush=True)
             continue
         for result in results[:6]:
-            text = result.snippet
-            if text:
-                for game in _extract_fixtures(_normalize_text(text), date_value):
+            if result.snippet:
+                for game in _extract_fixtures(_normalize_text(result.snippet), date_value):
                     if not any(x["id"] == game["id"] for x in games):
                         games.append(game)
 
@@ -148,7 +143,6 @@ async def _web_games_for_date(date_value: str) -> list[dict[str, Any]]:
 
 
 async def verified_games_for_date(date_value: str) -> list[dict[str, Any]]:
-    """Return KHL schedule from browser web research only."""
     try:
         games = await _web_games_for_date(date_value)
         print(f"KHL schedule source: BROWSER WEB RESEARCH ({len(games)} games) date={date_value}", flush=True)
