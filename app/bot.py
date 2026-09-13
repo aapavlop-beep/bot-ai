@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -13,18 +15,21 @@ from .ai_predictor_v2 import Best3AIPredictor
 from .config import settings
 from .khl_auto_refresh import KHLBackgroundCache
 from .khl_enhanced import EnhancedKHLService
-from .khl_schedule import verified_today_games
+from .khl_schedule import verified_games_for_date, verified_today_games
 from .keyboards import main_menu
 from .providers.api_sport_ru import ApiSportRuClient, ApiSportRuError
 from .storage import PredictionStore
 from .team_names import display_team_name
 
+MSK = ZoneInfo("Europe/Moscow")
 
 dp = Dispatcher()
 store = PredictionStore(settings.database_path)
-khl = EnhancedKHLService(ApiSportRuClient(settings.api_sport_ru_key)) if settings.api_sport_ru_key else None
+# The KHL service must exist even without API-SPORT credentials: the schedule
+# can be obtained from the official KHL mobile reserve and web research.
+khl = EnhancedKHLService(ApiSportRuClient(settings.api_sport_ru_key or ""))
 ai_predictor = Best3AIPredictor(settings.openai_api_key, settings.openai_model, settings.openai_base_url) if settings.openai_api_key else None
-khl_refresh = KHLBackgroundCache(khl, interval_minutes=60) if khl is not None else None
+khl_refresh = KHLBackgroundCache(khl, interval_minutes=30, days_ahead=3)
 
 
 def _team_obj(value: object) -> dict:
@@ -70,6 +75,11 @@ def khl_games_keyboard(games: list[dict]) -> InlineKeyboardMarkup:
             rows.append([InlineKeyboardButton(text=f"{home} — {away}", callback_data=f"khl:game:{game_id}")])
         else:
             rows.append([InlineKeyboardButton(text=f"⚠️ {home} — {away}", callback_data=f"khl:missing:{index}")])
+    rows.append([
+        InlineKeyboardButton(text="📅 Сегодня", callback_data="sport:khl"),
+        InlineKeyboardButton(text="➡️ Завтра", callback_data="khl:date:1"),
+    ])
+    rows.append([InlineKeyboardButton(text="📅 Послезавтра", callback_data="khl:date:2")])
     rows.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -81,6 +91,20 @@ def back_khl_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu")],
         ]
     )
+
+
+def _date_by_offset(offset: int) -> str:
+    return (datetime.now(MSK).date() + timedelta(days=offset)).isoformat()
+
+
+def _date_label(offset: int) -> str:
+    if offset == 0:
+        return "сегодня"
+    if offset == 1:
+        return "завтра"
+    if offset == 2:
+        return "послезавтра"
+    return _date_by_offset(offset)
 
 
 async def safe_edit(callback: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
@@ -131,54 +155,74 @@ async def callbacks(callback: CallbackQuery) -> None:
         elif data == "about":
             text = (
                 "ℹ️ <b>О боте</b>\n\n"
-                "Бот собирает спортивные данные, рассчитывает вероятности "
-                "и использует ИИ для итогового анализа.\n\n"
+                "Бот собирает спортивные данные, проверяет публичные источники, "
+                "рассчитывает вероятности и использует ИИ для итогового анализа.\n\n"
                 "Сейчас запускаем первый полноценный раздел — КХЛ."
             )
             markup = main_menu()
         elif data == "top":
             text = "🔥 <b>Лучшие прогнозы</b>\n\nПосле обновления аналитики здесь будут отображаться лучшие кандидаты по всем матчам."
             markup = main_menu()
-        elif data == "sport:khl":
-            if khl is None:
-                text = "🏒 <b>КХЛ</b>\n\nНе указан API_SPORT_RU_KEY в переменных Railway."
-                markup = main_menu()
+        elif data == "sport:khl" or data.startswith("khl:date:"):
+            offset = 0 if data == "sport:khl" else int(data.rsplit(":", 1)[1])
+            date_value = _date_by_offset(offset)
+            games = khl_refresh.get_games(date_value)
+            if not games:
+                games = await verified_games_for_date(khl.client, date_value)
+            games = [normalize_game_names(game) for game in games]
+            if not games:
+                text = (
+                    f"🏒 <b>КХЛ — {_date_label(offset)}</b>\n\n"
+                    "Матчи на эту дату не найдены в доступных источниках."
+                )
+                markup = khl_games_keyboard([])
             else:
-                games = khl_refresh.get_games() if khl_refresh and khl_refresh.get_games() else await verified_today_games(khl.client)
-                if not games:
-                    text = "🏒 <b>КХЛ</b>\n\nНа текущую дату резервные источники также не вернули матчи."
-                    markup = main_menu()
-                else:
-                    games = [normalize_game_names(game) for game in games]
-                    text = f"🏒 <b>КХЛ</b>\n\nМатчи на сегодня: {len(games)}\n\nВыбери матч:\n\n🔄 Данные обновляются автоматически каждый час."
-                    markup = khl_games_keyboard(games)
+                source = "резервный/смешанный источник"
+                if all(game.get("__khl_mobile") for game in games):
+                    source = "Официальный KHL mobile API"
+                elif all(game.get("__api_sport_ru") for game in games):
+                    source = "API-SPORT.ru"
+                text = (
+                    f"🏒 <b>КХЛ — {_date_label(offset)}</b>\n\n"
+                    f"📅 {date_value}\n"
+                    f"Матчей: <b>{len(games)}</b>\n"
+                    f"📡 Расписание: <b>{source}</b>\n\n"
+                    "Выбери матч:\n\n"
+                    "🔄 Расписание автоматически собирается и обновляется каждый день."
+                )
+                markup = khl_games_keyboard(games)
         elif data.startswith("khl:missing:"):
             text = "⚠️ <b>Матч не имеет идентификатора источника.</b>\n\nНевозможно получить линию и прогноз."
             markup = back_khl_keyboard()
         elif data.startswith("khl:game:"):
-            if khl is None:
-                text = "Не указан API_SPORT_RU_KEY в переменных Railway."
-                markup = main_menu()
-            elif ai_predictor is None:
+            if ai_predictor is None:
                 text = "⚠️ <b>ИИ не настроен.</b>\n\nДобавь OPENAI_API_KEY в переменные Railway и перезапусти бота."
                 markup = main_menu()
             else:
                 game_id = int(data.rsplit(":", 1)[1])
-                await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n1/5 Получаю данные матча из основного или резервного источника...")
-                cached = khl_refresh.get_context(game_id) if khl_refresh else None
+                await safe_status(callback, "🏒 <b>Глубокий анализ матча</b>\n\n1/6 Нахожу матч и актуальные данные...")
+                cached = khl_refresh.get_context(game_id)
                 if cached:
                     game, markets, analysis_data = cached
                 else:
-                    games = await verified_today_games(khl.client)
-                    game = next((item for item in games if int(item.get("id", -1)) == game_id), None)
+                    games = []
+                    for date_value in (_date_by_offset(i) for i in range(3)):
+                        games = khl_refresh.get_games(date_value)
+                        if not games:
+                            games = await verified_games_for_date(khl.client, date_value)
+                        game = next((item for item in games if int(item.get("id", -1)) == game_id), None)
+                        if game is not None:
+                            break
                     if game is None:
                         await safe_edit(callback, "Матч не найден. Обнови список матчей КХЛ.", back_khl_keyboard())
                         return
                     game = normalize_game_names(game)
-                    await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n2/5 Получаю доступные линии...")
-                    markets = await khl.markets_for_game(game_id, game)
-                    await safe_status(callback, "🏒 <b>Подготовка прогноза</b>\n\n3/5 Получаю статистику, форму и очные встречи из доступных источников...")
+                    await safe_status(callback, "🏒 <b>Глубокий анализ матча</b>\n\n2/6 Ищу составы, травмы и дисквалификации...")
+                    # analysis_for_game performs multi-source public-web research
+                    # in addition to API/reserve statistics.
                     analysis_data = await khl.analysis_for_game(game)
+                    await safe_status(callback, "🏒 <b>Глубокий анализ матча</b>\n\n3/6 Проверяю форму, H2H, таблицу и последние результаты...")
+                    markets = await khl.markets_for_game(game_id, game)
                 game = normalize_game_names(game)
                 match = khl.to_match(game, markets, analysis_data)
                 if not match.markets:
@@ -194,8 +238,8 @@ async def callbacks(callback: CallbackQuery) -> None:
                     await safe_status(
                         callback,
                         f"🏒 <b>{match.home} — {match.away}</b>\n\n"
-                        f"4/5 Линий получено: <b>{len(match.markets)}</b>\n"
-                        "🤖 ИИ выбирает лучший прогноз и две сильные альтернативы...",
+                        "4/6 Проверяю актуальность найденных данных...\n"
+                        "5/6 ИИ оценивает все факторы и ищет перевес над линией...",
                     )
                     try:
                         predictions = await asyncio.wait_for(asyncio.to_thread(ai_predictor.predict, match), timeout=90.0)
