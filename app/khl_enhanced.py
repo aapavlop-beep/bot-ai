@@ -3,52 +3,20 @@ from __future__ import annotations
 from typing import Any
 
 from .models import Market, Match, Sport
-from .providers.khl_mobile import KHLMobileClient
-from .providers.sofascore_khl import SofaScoreKHLClient
 from .web_odds import markets_from_web_research
 from .web_odds_search import search_bookmaker_web
 from .web_research import KHLWebResearcher
 
 
 class EnhancedKHLService:
-    """KHL analysis using official KHL data plus public web research."""
+    """KHL analysis using browser-style web research only.
+
+    No sports API is consulted here. All match facts, team news and bookmaker
+    lines must come from the web-research layer.
+    """
 
     def __init__(self) -> None:
-        self.khl_mobile = KHLMobileClient()
-        self.sofascore = SofaScoreKHLClient()
         self.web_research = KHLWebResearcher()
-
-    @staticmethod
-    def _norm(value: str) -> str:
-        value = value.lower().replace("ё", "е")
-        for char in "—–-.,:()[]{}'\"":
-            value = value.replace(char, " ")
-        return " ".join(value.split())
-
-    @classmethod
-    def _same_team(cls, left: str, right: str) -> bool:
-        a, b = cls._norm(left), cls._norm(right)
-        if not a or not b:
-            return False
-        if a == b or a in b or b in a:
-            return True
-        at, bt = set(a.split()), set(b.split())
-        return len(at & bt) >= max(1, min(len(at), len(bt)) - 1)
-
-    async def _find_sofascore_match(self, game: dict[str, Any]) -> dict[str, Any] | None:
-        teams = game.get("teams") or {}
-        home = str((teams.get("home") or {}).get("name") or "")
-        away = str((teams.get("away") or {}).get("name") or "")
-        date = str(game.get("date") or game.get("datetime") or "")[:10]
-        candidates = await self.sofascore.today_games(date)
-        return next(
-            (
-                item for item in candidates
-                if self._same_team(str((item.get("teams") or {}).get("home", {}).get("name") or ""), home)
-                and self._same_team(str((item.get("teams") or {}).get("away", {}).get("name") or ""), away)
-            ),
-            None,
-        )
 
     async def markets_for_game(
         self,
@@ -56,17 +24,15 @@ class EnhancedKHLService:
         game: dict[str, Any] | None = None,
         analysis_data: dict[str, Any] | None = None,
     ) -> tuple[Market, ...]:
-        # 1) Use research already collected for the match.
         if analysis_data:
             web_context = analysis_data.get("веб_исследование") or {}
             markets, meta = markets_from_web_research(web_context)
             analysis_data["веб_линии"] = meta
             if markets:
-                analysis_data["режим_линии"] = "web bookmaker research"
+                analysis_data["режим_линии"] = "browser web research"
                 print(f"KHL web odds: found {len(markets)} markets", flush=True)
                 return markets
 
-        # 2) Dedicated search for the four requested bookmakers.
         if game:
             teams = game.get("teams") or {}
             home = str((teams.get("home") or {}).get("name") or "")
@@ -77,99 +43,76 @@ class EnhancedKHLService:
                 if odds:
                     markets = tuple(Market(name, odd, 1 / odd) for name, odd in odds.items())
                     if analysis_data is not None:
-                        analysis_data["режим_линии"] = "dedicated bookmaker web search"
+                        analysis_data["режим_линии"] = "dedicated browser bookmaker research"
                         analysis_data["веб_линии"] = {
                             "статус": "найдено",
                             "разрешенные_БК": ["Winline", "Фонбет", "BetBoom", "Parimatch"],
                             "источники_линии": {
-                                name: {"БК": bookmakers.get(name, ""), "тип": "web comparison"}
+                                name: {"БК": bookmakers.get(name, ""), "тип": "browser web research"}
                                 for name in odds
                             },
                         }
                     print(
-                        "KHL dedicated bookmaker odds: "
+                        "KHL browser bookmaker odds: "
                         + ", ".join(f"{name}={odd} ({bookmakers.get(name, '')})" for name, odd in odds.items()),
                         flush=True,
                     )
                     return markets
             except Exception as exc:
-                print(f"KHL dedicated bookmaker odds failed: {type(exc).__name__}: {exc}", flush=True)
+                print(f"KHL browser bookmaker research failed: {type(exc).__name__}: {exc}", flush=True)
 
-        # No other odds source is accepted. In particular, do not use SofaScore
-        # or an unnamed aggregator as a bookmaker line.
-        print("KHL odds: no confirmed Winline/Fonbet/BetBoom/Parimatch line found", flush=True)
+        print("KHL web odds: no confirmed Winline/Fonbet/BetBoom/Parimatch line found", flush=True)
         return ()
 
-    async def _web_context(self, home: str, away: str, start: str) -> dict[str, Any]:
-        date = start[:10] or ""
+    async def analysis_for_game(self, game: dict[str, Any]) -> dict[str, Any]:
+        teams = game.get("teams") or {}
+        home = str((teams.get("home") or {}).get("name") or "")
+        away = str((teams.get("away") or {}).get("name") or "")
+        start = str(game.get("date") or game.get("datetime") or "")
+        date = start[:10]
+
         try:
-            return await self.web_research.research_match(home, away, date)
+            web_context = await self.web_research.research_match(home, away, date)
         except Exception as exc:
-            print(f"KHL web research failed: {type(exc).__name__}: {exc}", flush=True)
-            return {
+            print(f"KHL browser web research failed: {type(exc).__name__}: {exc}", flush=True)
+            web_context = {
                 "собрано_в_utc": "",
-                "метод": "web search + page extraction",
+                "матч": f"{home} — {away}",
+                "дата_матча": date,
+                "метод": "Google/Bing web search + HTML page extraction",
                 "источники": [],
                 "ошибка": type(exc).__name__,
             }
 
-    @staticmethod
-    def _merge_web_context(context: dict[str, Any], web_context: dict[str, Any]) -> dict[str, Any]:
-        context["веб_исследование"] = web_context
-        context["веб_источники"] = web_context.get("источники", [])
-        context["источники_проверки"] = [
-            "Официальный KHL Mobile API",
-            "Официальные/спортивные сайты через web search",
-            *([context.get("активный_источник_статистики")] if context.get("активный_источник_статистики") else []),
-        ]
-        context["режим_источника"] = "KHL mobile API + multi-source web research"
-        context["правило_травм_и_составов"] = (
-            "Не считать игрока травмированным или отсутствующим без подтверждённого текста источника. "
-            "Для свежих кадровых новостей приоритет официальному клубу/KHL.ru; дата публикации обязательна для оценки свежести."
-        )
-        context["правило_коэффициентов"] = (
-            "Использовать только текущие коэффициенты Winline, Фонбет, BetBoom или Parimatch, "
-            "полученные с их публичных страниц либо из страницы сравнения, где строка явно подписана названием БК. "
-            "Не использовать SofaScore, API-SPORT, неидентифицированные агрегаторы или выдуманные значения."
-        )
-        context["статистика_для_ии"] = {
-            "базовые_данные": context.get("статистика_для_ии", context.copy()),
+        source_count = len(web_context.get("источники") or [])
+        official_count = sum(1 for s in web_context.get("источники") or [] if s.get("тип_источника") == "official")
+        analysis_data: dict[str, Any] = {
+            "активный_источник_статистики": "browser web research",
+            "резервный_источник": "browser web research",
+            "режим_источника": "browser-only web research",
             "веб_исследование": web_context,
+            "веб_источники": web_context.get("источники", []),
+            "источники_проверки": [s.get("url") for s in web_context.get("источники", []) if s.get("url")][:20],
+            "статистика_для_ии": web_context,
+            "качество_активных_данных": {
+                "история_хозяев": 0,
+                "история_гостей": 0,
+                "h2h": 0,
+                "есть_сезонная_статистика": bool((web_context.get("структурированные_доказательства") or {}).get("standings")),
+                "есть_таблица": bool((web_context.get("структурированные_доказательства") or {}).get("standings")),
+                "web_sources": source_count,
+                "official_sources": official_count,
+            },
+            "правило_травм_и_составов": (
+                "Использовать только явно подтверждённые веб-источниками сведения. "
+                "Отсутствие игрока в составе само по себе не означает травму."
+            ),
+            "правило_коэффициентов": (
+                "Использовать только текущие коэффициенты Winline, Фонбет, BetBoom или Parimatch, "
+                "полученные через браузерный web research. Не использовать API, SofaScore или неидентифицированные линии."
+            ),
         }
-        return context
-
-    async def analysis_for_game(self, game: dict[str, Any]) -> dict[str, Any]:
-        home = str(((game.get("teams") or {}).get("home") or {}).get("name") or "")
-        away = str(((game.get("teams") or {}).get("away") or {}).get("name") or "")
-        start = str(game.get("date") or game.get("datetime") or "")
-
-        web_context = await self._web_context(home, away, start)
-
-        if game.get("__khl_mobile"):
-            context = await self.khl_mobile.build_match_context(home, away, start)
-            context["активный_источник_статистики"] = "Официальный KHL Mobile API + web research"
-            context["резервный_источник"] = "web research"
-            return self._merge_web_context(context, web_context)
-
-        if game.get("__sofascore"):
-            context = await self.sofascore.build_context(game)
-            context["активный_источник_статистики"] = "SofaScore + web research"
-            context["резервный_источник"] = "web research"
-            return self._merge_web_context(context, web_context)
-
-        try:
-            context = await self.khl_mobile.build_match_context(home, away, start)
-            context["активный_источник_статистики"] = "Официальный KHL Mobile API + web research"
-            context["резервный_источник"] = "web research"
-            return self._merge_web_context(context, web_context)
-        except Exception as exc:
-            print(f"Official KHL Mobile context failed: {type(exc).__name__}: {exc}; using web research", flush=True)
-            context = {
-                "активный_источник_статистики": "web research",
-                "резервный_источник": "web search",
-                "источники": [],
-            }
-            return self._merge_web_context(context, web_context)
+        return analysis_data
 
     @staticmethod
     def to_match(game: dict[str, Any], markets: tuple[Market, ...] = (), analysis_data: dict[str, Any] | None = None) -> Match:
