@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -13,34 +15,75 @@ class ApiSportRuError(RuntimeError):
 
 
 class ApiSportRuClient:
-    """Client for API-SPORT.ru Sport Events API (v2)."""
+    """API-SPORT.ru client with request caching and KHL-oriented data shaping.
+
+    Important design rule: one logical KHL prediction must not fan out into a
+    request per market, per statistic, per H2H record, etc. The /matches feed
+    already contains the event, teams and usually odds. Historical form is
+    loaded with one team_id request per unique team and cached.
+    """
 
     BASE_URL = "https://api.api-sport.ru/v2"
+    MATCH_CACHE_TTL = 300.0
+    TEAM_CACHE_TTL = 1800.0
+    DETAIL_CACHE_TTL = 300.0
 
     def __init__(self, api_key: str, timeout: float = 20.0) -> None:
         self.api_key = api_key
         self.timeout = timeout
+        self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._lock = asyncio.Lock()
+        self.request_count = 0
 
-    async def get(self, path: str, **params: Any) -> dict[str, Any]:
+    @staticmethod
+    def _cache_key(path: str, params: dict[str, Any]) -> str:
+        parts = [path]
+        for key in sorted(params):
+            parts.append(f"{key}={params[key]}")
+        return "?".join([parts[0], "&".join(parts[1:])]) if len(parts) > 1 else parts[0]
+
+    async def get(self, path: str, cache_ttl: float = 0.0, **params: Any) -> dict[str, Any]:
         url = f"{self.BASE_URL}/{path.lstrip('/')}"
         safe_params = {k: v for k, v in params.items() if v is not None}
-        print(f"API-SPORT.ru REQUEST: GET {url} params={safe_params}", flush=True)
-        headers = {"Authorization": self.api_key, "Accept": "application/json"}
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.get(url, headers=headers, params=safe_params)
-                print(
-                    f"API-SPORT.ru RESPONSE: GET {url} status={response.status_code} bytes={len(response.content)}",
-                    flush=True,
-                )
-                response.raise_for_status()
-                payload = response.json()
-        except Exception as exc:
-            print(f"API-SPORT.ru ERROR: GET {url} {type(exc).__name__}: {exc}", flush=True)
-            raise
-        if not isinstance(payload, dict):
-            raise ApiSportRuError("API-SPORT.ru returned a non-object response")
-        return payload
+        key = self._cache_key(path, safe_params)
+        now = time.monotonic()
+
+        if cache_ttl > 0:
+            cached = self._cache.get(key)
+            if cached and now - cached[0] < cache_ttl:
+                print(f"API-SPORT.ru CACHE HIT: GET {url} params={safe_params}", flush=True)
+                return cached[1]
+
+        async with self._lock:
+            # Re-check after waiting for another coroutine that may have filled it.
+            now = time.monotonic()
+            if cache_ttl > 0:
+                cached = self._cache.get(key)
+                if cached and now - cached[0] < cache_ttl:
+                    print(f"API-SPORT.ru CACHE HIT: GET {url} params={safe_params}", flush=True)
+                    return cached[1]
+
+            self.request_count += 1
+            print(f"API-SPORT.ru REQUEST #{self.request_count}: GET {url} params={safe_params}", flush=True)
+            headers = {"Authorization": self.api_key, "Accept": "application/json"}
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
+                    response = await client.get(url, headers=headers, params=safe_params)
+                    print(
+                        f"API-SPORT.ru RESPONSE: GET {url} status={response.status_code} bytes={len(response.content)}",
+                        flush=True,
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+            except Exception as exc:
+                print(f"API-SPORT.ru ERROR: GET {url} {type(exc).__name__}: {exc}", flush=True)
+                raise
+
+            if not isinstance(payload, dict):
+                raise ApiSportRuError("API-SPORT.ru returned a non-object response")
+            if cache_ttl > 0:
+                self._cache[key] = (time.monotonic(), payload)
+            return payload
 
     @staticmethod
     def _items(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -74,12 +117,30 @@ class ApiSportRuClient:
             return str(translations["ru"])
         return str(team.get("name") or team.get("fullName") or team.get("shortName") or "")
 
+    @staticmethod
+    def _id(value: Any) -> int | None:
+        if isinstance(value, dict):
+            value = value.get("id")
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _team_obj(cls, match: dict[str, Any], side: str) -> dict[str, Any]:
+        teams = match.get("teams") or {}
+        value = match.get("homeTeam" if side == "home" else "awayTeam")
+        if not isinstance(value, dict):
+            value = teams.get(side)
+        return value if isinstance(value, dict) else {}
+
     @classmethod
     def _teams(cls, match: dict[str, Any]) -> tuple[str, str]:
-        teams = match.get("teams") or {}
-        home = match.get("homeTeam") or match.get("home") or teams.get("home")
-        away = match.get("awayTeam") or match.get("away") or teams.get("away")
-        return cls._name(home), cls._name(away)
+        return cls._name(cls._team_obj(match, "home")), cls._name(cls._team_obj(match, "away"))
+
+    @classmethod
+    def _team_id(cls, match: dict[str, Any], side: str) -> int | None:
+        return cls._id(cls._team_obj(match, side))
 
     @staticmethod
     def _match_date(match: dict[str, Any]) -> str:
@@ -139,6 +200,8 @@ class ApiSportRuClient:
 
     @classmethod
     def normalize_match(cls, match: dict[str, Any]) -> dict[str, Any]:
+        home_obj = cls._team_obj(match, "home")
+        away_obj = cls._team_obj(match, "away")
         home, away = cls._teams(match)
         tournament = match.get("tournament") or match.get("league") or {}
         tournament_name = tournament.get("name") if isinstance(tournament, dict) else str(tournament or "КХЛ")
@@ -146,21 +209,43 @@ class ApiSportRuClient:
             "id": match.get("id"),
             "date": cls._match_date(match),
             "datetime": cls._match_date(match),
-            "teams": {"home": {"name": home}, "away": {"name": away}},
-            "league": {"name": str(tournament_name or "КХЛ"), "id": tournament.get("id") if isinstance(tournament, dict) else None},
+            "teams": {
+                "home": {"id": cls._id(home_obj), "name": home},
+                "away": {"id": cls._id(away_obj), "name": away},
+            },
+            "league": {
+                "name": str(tournament_name or "КХЛ"),
+                "id": tournament.get("id") if isinstance(tournament, dict) else None,
+            },
             "__api_sport_ru": True,
             "__raw_api_sport_ru": match,
         }
 
     async def khl_matches(self, date: str | None = None) -> list[dict[str, Any]]:
-        payload = await self.get("ice-hockey/matches", date=date, limit=100)
+        payload = await self.get("ice-hockey/matches", date=date, limit=100, cache_ttl=self.MATCH_CACHE_TTL)
         matches = self._items(payload)
-        khl = [item for item in matches if self._is_khl(item)]
-        return khl or matches
+        return [item for item in matches if self._is_khl(item)] or matches
 
     async def match_by_id(self, match_id: int | str) -> dict[str, Any]:
-        payload = await self.get(f"ice-hockey/matches/{int(match_id)}")
+        payload = await self.get(f"ice-hockey/matches/{int(match_id)}", cache_ttl=self.DETAIL_CACHE_TTL)
         return self._one(payload)
+
+    async def team_matches(
+        self,
+        team_id: int,
+        tournament_id: int | None = None,
+        season_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        payload = await self.get(
+            "ice-hockey/matches",
+            team_id=team_id,
+            status="finished",
+            tournament_id=tournament_id,
+            season_id=season_id,
+            limit=30,
+            cache_ttl=self.TEAM_CACHE_TTL,
+        )
+        return self._items(payload)
 
     @staticmethod
     def markets_from_match(match: dict[str, Any]) -> tuple[Market, ...]:
@@ -173,8 +258,10 @@ class ApiSportRuClient:
         for market in odds:
             if not isinstance(market, dict):
                 continue
-            market_name = str(market.get("name") or market.get("group") or "Рынок")
+            market_name = str(market.get("name") or market.get("group") or market.get("key") or "Рынок")
             values = market.get("choices") or market.get("outcomes") or market.get("values") or []
+            if isinstance(values, dict):
+                values = values.get("choices") or values.get("outcomes") or values.get("values") or []
             if not isinstance(values, list):
                 continue
             parsed: list[tuple[str, float]] = []
@@ -213,92 +300,174 @@ class ApiSportRuClient:
         if isinstance(value, list):
             return [ApiSportRuClient._compact(item, depth + 1) for item in value[:30]]
         if isinstance(value, dict):
-            result: dict[str, Any] = {}
-            for key, item in value.items():
-                compact = ApiSportRuClient._compact(item, depth + 1)
-                if compact is not None or item is None:
-                    result[str(key)] = compact
-            return result
+            return {
+                str(key): ApiSportRuClient._compact(item, depth + 1)
+                for key, item in value.items()
+            }
         return str(value)
 
     @classmethod
-    def _count_history(cls, value: Any) -> int:
-        if isinstance(value, list):
-            dicts = [x for x in value if isinstance(x, dict)]
-            if dicts and any(any(k in x for k in ("dateEvent", "startTimestamp", "homeTeam", "awayTeam", "homeScore", "awayScore", "homeScoreDisplay", "awayScoreDisplay")) for x in dicts):
-                return len(dicts)
-            return max((cls._count_history(x) for x in value), default=0)
+    def _score(cls, match: dict[str, Any], side: str) -> int | None:
+        key = "homeScore" if side == "home" else "awayScore"
+        value = match.get(key)
         if isinstance(value, dict):
-            for key in ("matches", "games", "results", "history", "lastMatches", "previousMatches", "items", "events", "form"):
-                if key in value:
-                    count = cls._count_history(value[key])
-                    if count:
-                        return count
-            return max((cls._count_history(x) for x in value.values()), default=0)
-        return 0
+            value = value.get("current") or value.get("display") or value.get("goals") or value.get("score")
+        if value is None:
+            scores = match.get("scores") or match.get("score") or {}
+            side_value = scores.get(side) if isinstance(scores, dict) else None
+            if isinstance(side_value, dict):
+                value = side_value.get("current") or side_value.get("goals") or side_value.get("score")
+            else:
+                value = side_value
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
 
     @classmethod
-    def _quality(cls, pregame: Any) -> dict[str, int | bool]:
-        empty = {"история_хозяев": 0, "история_гостей": 0, "h2h": 0, "есть_таблица": False, "есть_сезонная_статистика": False}
-        if not isinstance(pregame, dict):
-            return empty
-        form = pregame.get("form") or pregame.get("teamForm") or {}
-        h2h = pregame.get("h2h") or pregame.get("headToHead") or {}
-        home_form = form.get("home") or form.get("homeTeam") or form.get("host") if isinstance(form, dict) else None
-        away_form = form.get("away") or form.get("awayTeam") or form.get("guest") if isinstance(form, dict) else None
-        home_count = cls._count_history(home_form) if home_form is not None else 0
-        away_count = cls._count_history(away_form) if away_form is not None else 0
+    def _history_row(cls, game: dict[str, Any], team_id: int) -> dict[str, Any] | None:
+        home, away = cls._teams(game)
+        home_id = cls._team_id(game, "home")
+        side = "home" if home_id == team_id else "away"
+        hs, aws = cls._score(game, "home"), cls._score(game, "away")
+        if hs is None or aws is None:
+            return None
+        team_score = hs if side == "home" else aws
+        opp_score = aws if side == "home" else hs
         return {
-            "история_хозяев": home_count,
-            "история_гостей": away_count,
-            "h2h": cls._count_history(h2h),
-            "есть_таблица": bool(pregame.get("standings") or pregame.get("table")),
-            "есть_сезонная_статистика": bool(form or pregame.get("teamStreaks") or pregame.get("seasonStats")),
+            "дата": cls._match_date(game)[:10],
+            "хозяева": home,
+            "гости": away,
+            "счёт": f"{hs}:{aws}",
+            "результат": "победа" if team_score > opp_score else "поражение" if team_score < opp_score else "ничья",
+            "забито": team_score,
+            "пропущено": opp_score,
+            "дом": side == "home",
         }
 
-    async def find_khl_match(self, home: str, away: str, start_time: str = "") -> dict[str, Any] | None:
-        date = start_time[:10] if len(start_time) >= 10 else datetime.now(timezone.utc).date().isoformat()
-        payload = await self.get("ice-hockey/matches", date=date, with_pregame="true", limit=100)
-        matches = self._items(payload)
-        candidates = [item for item in matches if self._is_khl(item)]
-        found = self._find_match(candidates, home, away) or self._find_match(matches, home, away)
-        if found:
-            return found
-        for query in (f"{home} {away}", home, away):
-            try:
-                search_payload = await self.get("ice-hockey/matches", q=query, limit=50, with_pregame="true")
-                found = self._find_match(self._items(search_payload), home, away)
-                if found:
-                    return found
-            except Exception:
+    @classmethod
+    def _form(cls, games: list[dict[str, Any]], team_id: int, limit: int = 10) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        rows = []
+        for game in sorted(games, key=cls._match_date, reverse=True):
+            row = cls._history_row(game, team_id)
+            if row:
+                rows.append(row)
+            if len(rows) >= limit:
+                break
+        wins = sum(row["результат"] == "победа" for row in rows)
+        draws = sum(row["результат"] == "ничья" for row in rows)
+        losses = len(rows) - wins - draws
+        scored = sum(row["забито"] for row in rows)
+        conceded = sum(row["пропущено"] for row in rows)
+        count = len(rows)
+        summary = {
+            "матчей": count,
+            "побед": wins,
+            "ничьих": draws,
+            "поражений": losses,
+            "забито": scored,
+            "пропущено": conceded,
+            "среднее_забито": round(scored / count, 2) if count else None,
+            "среднее_пропущено": round(conceded / count, 2) if count else None,
+        }
+        return rows, summary
+
+    @classmethod
+    def _h2h(cls, games: list[dict[str, Any]], home_id: int, away_id: int, limit: int = 10) -> list[dict[str, Any]]:
+        result = []
+        for game in sorted(games, key=cls._match_date, reverse=True):
+            ids = {cls._team_id(game, "home"), cls._team_id(game, "away")}
+            if home_id not in ids or away_id not in ids:
                 continue
-        return None
+            hs, aws = cls._score(game, "home"), cls._score(game, "away")
+            if hs is None or aws is None:
+                continue
+            result.append({
+                "дата": cls._match_date(game)[:10],
+                "хозяева": cls._teams(game)[0],
+                "гости": cls._teams(game)[1],
+                "счёт": f"{hs}:{aws}",
+            })
+            if len(result) >= limit:
+                break
+        return result
 
-    async def build_context(self, home: str, away: str, start_time: str = "") -> dict[str, Any]:
-        match = await self.find_khl_match(home, away, start_time)
-        if not match:
-            return {"источник_статистики": "API-SPORT.ru", "матч_найден": False, "качество_данных": {"история_хозяев": 0, "история_гостей": 0, "h2h": 0, "есть_таблица": False, "есть_сезонная_статистика": False}}
-        match_id = match.get("id")
-        detail = match
-        if match_id is not None:
-            try:
-                detail = await self.match_by_id(match_id)
-            except Exception:
-                detail = match
-        pregame = detail.get("pregame") or match.get("pregame") or {}
-        return {
-            "источник_статистики": "API-SPORT.ru",
-            "матч_найден": True,
-            "match_id": match_id,
-            "турнир": self._compact(detail.get("tournament") or match.get("tournament")),
-            "сезон": self._compact(detail.get("season") or match.get("season")),
-            "команды": {"хозяева": self._teams(detail)[0], "гости": self._teams(detail)[1]},
-            "статус": detail.get("status"),
-            "счёт": self._compact(detail.get("homeScore")),
-            "счёт_гостей": self._compact(detail.get("awayScore")),
+    async def build_context(self, game: dict[str, Any]) -> dict[str, Any]:
+        """Build useful pre-match context with at most two history requests.
+
+        The daily /matches response is reused as the primary event payload. If
+        it already contains pregame data we keep it; otherwise two cached
+        team-history requests provide recent form and H2H locally.
+        """
+        raw = game.get("__raw_api_sport_ru") if isinstance(game, dict) else None
+        raw = raw if isinstance(raw, dict) else game
+        home, away = self._teams(raw)
+        home_id, away_id = self._team_id(raw, "home"), self._team_id(raw, "away")
+        tournament = raw.get("tournament") or raw.get("league") or {}
+        tournament_id = self._id(tournament)
+        season = raw.get("season") or {}
+        season_id = self._id(season)
+        pregame = raw.get("pregame") or {}
+
+        context: dict[str, Any] = {
+            "источники": ["API-SPORT.ru"],
+            "главный_источник_статистики": "API-SPORT.ru",
+            "активный_источник_статистики": "API-SPORT.ru",
+            "режим_источника": "API-SPORT.ru (единственный источник)",
+            "матч_найден": bool(raw.get("id") or game.get("id")),
+            "match_id": raw.get("id") or game.get("id"),
+            "турнир": self._compact(tournament),
+            "сезон": self._compact(season),
+            "команды": {"хозяева": home, "гости": away},
+            "статус": self._compact(raw.get("status")),
             "форма_и_серии": self._compact(pregame),
-            "статистика_матча": self._compact(detail.get("matchStatistics")),
-            "коэффициенты": self._compact(detail.get("oddsBase")),
-            "букмекерские_коэффициенты": self._compact(detail.get("oddsBk")),
-            "качество_данных": self._quality(pregame),
+            "статистика_матча": self._compact(raw.get("matchStatistics")),
+            "события": self._compact(raw.get("liveEvents")),
+            "коэффициенты": self._compact(raw.get("oddsBase")),
+            "букмекерские_коэффициенты": self._compact(raw.get("oddsBk")),
         }
+
+        home_games: list[dict[str, Any]] = []
+        away_games: list[dict[str, Any]] = []
+        if home_id is not None:
+            home_games = await self.team_matches(home_id, tournament_id, season_id)
+        if away_id is not None and away_id != home_id:
+            away_games = await self.team_matches(away_id, tournament_id, season_id)
+
+        home_rows, home_form = self._form(home_games, home_id or -1)
+        away_rows, away_form = self._form(away_games, away_id or -1)
+        h2h_games = home_games + [g for g in away_games if g.get("id") not in {x.get("id") for x in home_games}]
+        h2h = self._h2h(h2h_games, home_id or -1, away_id or -1)
+
+        context["форма_хозяев"] = home_rows
+        context["форма_гостей"] = away_rows
+        context["итоги_формы_хозяев"] = home_form
+        context["итоги_формы_гостей"] = away_form
+        context["очные_встречи_api_sport_ru"] = h2h
+        context["качество_активных_данных"] = {
+            "история_хозяев": len(home_rows),
+            "история_гостей": len(away_rows),
+            "h2h": len(h2h),
+            "есть_таблица": False,
+            "есть_сезонная_статистика": bool(raw.get("matchStatistics") or pregame or home_rows or away_rows),
+        }
+        context["статистика_для_ии"] = {
+            "турнир": context["турнир"],
+            "сезон": context["сезон"],
+            "команды": context["команды"],
+            "форма_хозяев": home_rows,
+            "форма_гостей": away_rows,
+            "итоги_формы_хозяев": home_form,
+            "итоги_формы_гостей": away_form,
+            "очные_встречи_api_sport_ru": h2h,
+            "статистика_матча": context["статистика_матча"],
+            "коэффициенты": context["коэффициенты"],
+            "качество_активных_данных": context["качество_активных_данных"],
+        }
+        q = context["качество_активных_данных"]
+        context["диагностика_статистики"] = (
+            f"Источник: API-SPORT.ru; последние матчи: хозяева {q['история_хозяев']}, "
+            f"гости {q['история_гостей']}; H2H: {q['h2h']}; "
+            f"таблица: нет; расширенные данные: {'да' if q['есть_сезонная_статистика'] else 'нет'}."
+        )
+        return context
